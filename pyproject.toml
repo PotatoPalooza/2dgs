@@ -1,0 +1,7 @@
+[project]
+name = "2dgs"
+version = "0.1.0"
+description = "2D Gaussian Splatting for Image Compression"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
