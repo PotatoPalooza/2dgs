@@ -2,6 +2,7 @@ import json
 import math
 import os
 import time
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -187,6 +188,15 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
+    # Instant-GI integration
+    use_instant_gi: bool = False
+    # Path to Instant-GI checkpoint
+    instant_gi_ckpt: Optional[str] = None
+    # Weight for Chamfer distance loss
+    instant_gi_lambda: float = 0.1
+    # Path to Instant-GI root directory (optional, defaults to assuming sibling directory)
+    instant_gi_root: Optional[str] = None
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -299,6 +309,44 @@ def create_splats_with_optimizers(
         for name, _, lr in params
     }
     return splats, optimizers
+
+
+def chamfer_distance(x, y):
+    """
+    Compute Chamfer distance between two point clouds x and y.
+    x: [N, D]
+    y: [M, D]
+    Returns: scalar loss
+    """
+    # x: [N, D], y: [M, D]
+    # We want to compute min_y ||x - y||^2 for each x, and min_x ||x - y||^2 for each y
+    
+    # Efficient implementation using chunking to avoid OOM
+    # If N, M are small (< 10000), we can do full broadcast
+    
+    N, D = x.shape
+    M, _ = y.shape
+    
+    # Chunk size
+    chunk_size = 1000
+    
+    # Compute dist from x to y
+    min_dist_x2y = torch.zeros(N, device=x.device)
+    for i in range(0, N, chunk_size):
+        x_chunk = x[i:i+chunk_size] # [B, D]
+        # dists: [B, M]
+        dists = torch.cdist(x_chunk.unsqueeze(0), y.unsqueeze(0), p=2).squeeze(0) ** 2
+        min_dist_x2y[i:i+chunk_size] = dists.min(dim=1)[0]
+        
+    # Compute dist from y to x
+    min_dist_y2x = torch.zeros(M, device=y.device)
+    for i in range(0, M, chunk_size):
+        y_chunk = y[i:i+chunk_size] # [B, D]
+        # dists: [B, N]
+        dists = torch.cdist(y_chunk.unsqueeze(0), x.unsqueeze(0), p=2).squeeze(0) ** 2
+        min_dist_y2x[i:i+chunk_size] = dists.min(dim=1)[0]
+        
+    return min_dist_x2y.mean() + min_dist_y2x.mean()
 
 
 class Runner:
@@ -479,6 +527,85 @@ class Runner:
                 output_dir=Path(cfg.result_dir),
                 mode="training",
             )
+
+        # Instant-GI setup
+        self.instant_gi_data = {}
+        if cfg.use_instant_gi:
+            self.setup_instant_gi()
+
+    def setup_instant_gi(self):
+        cfg = self.cfg
+        print("Setting up Instant-GI...")
+        
+        # Determine Instant-GI root
+        if cfg.instant_gi_root:
+            igi_root = Path(cfg.instant_gi_root).resolve()
+        else:
+            # Assume sibling directory
+            igi_root = Path(__file__).parent.parent.parent / "Instant-GI"
+            
+        if not igi_root.exists():
+             raise FileNotFoundError(f"Instant-GI root not found at {igi_root}")
+             
+        print(f"Instant-GI root: {igi_root}")
+        sys.path.append(str(igi_root))
+        
+        try:
+            from generalizable_model.init_net import InitNet
+        except ImportError as e:
+            raise ImportError(f"Failed to import InitNet from {igi_root}. Make sure dependencies are installed.") from e
+
+        self.init_net = InitNet().to(self.device)
+        
+        if cfg.instant_gi_ckpt:
+            print(f"Loading Instant-GI checkpoint from {cfg.instant_gi_ckpt}")
+            ckpt = torch.load(cfg.instant_gi_ckpt, map_location=self.device)
+            if "model" in ckpt:
+                self.init_net.load_state_dict(ckpt["model"])
+            else:
+                self.init_net.load_state_dict(ckpt)
+        else:
+            print("WARNING: No Instant-GI checkpoint provided. Using random initialization.")
+            
+        self.init_net.eval()
+        self.prepare_instant_gi_data()
+
+    def prepare_instant_gi_data(self):
+        print("Preparing Instant-GI data (generating 2D splats)...")
+        # Iterate over training images
+        # We need to access the dataset directly
+        
+        # Create a temporary loader to iterate once
+        loader = torch.utils.data.DataLoader(
+            self.trainset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=4
+        )
+        
+        with torch.no_grad():
+            for data in tqdm.tqdm(loader, desc="Instant-GI Init"):
+                image_id = data["image_id"].item()
+                # Image is [1, H, W, 3] in 0-255
+                # InitNet expects [1, 3, H, W] in 0-1 (check train_init_net.py)
+                # simple_trainer.py loads images as [H, W, 3] 0-255 in dataset, 
+                # but the collate_fn or just the loop converts them.
+                # In train loop: pixels = data["image"].to(device) / 255.0
+                
+                pixels = data["image"].to(self.device) / 255.0 # [1, H, W, 3]
+                pixels = pixels.permute(0, 3, 1, 2) # [1, 3, H, W]
+                
+                # InitNet forward with get_gaussians=True
+                # returns xy, scaling, rotation, color, triangles
+                # xy is [N, 2] in range [-1, 1]
+                
+                xy, _, _, _, _ = self.init_net(pixels, get_gaussians=True)
+                
+                # Store xy for this image
+                self.instant_gi_data[image_id] = xy.detach()
+                
+        print(f"Generated 2D splats for {len(self.instant_gi_data)} images.")
+
 
     def rasterize_splats(
         self,
@@ -709,6 +836,43 @@ class Runner:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
 
+            if cfg.use_instant_gi:
+                # Instant-GI Chamfer Distance Loss
+                # means2d: [N_visible, 2] in pixel coords
+                means2d = info["means2d"]
+                
+                # Normalize to [-1, 1]
+                means2d_norm = torch.stack([
+                    means2d[:, 0] / (width - 1) * 2 - 1,
+                    means2d[:, 1] / (height - 1) * 2 - 1
+                ], dim=-1)
+                
+                # Get target 2D Gaussians for this image
+                # image_ids is [1] for batch size 1
+                # We assume batch size 1 for now as per simple_trainer defaults
+                curr_img_id = image_ids[0].item()
+                if curr_img_id in self.instant_gi_data:
+                    target_xy = self.instant_gi_data[curr_img_id].to(self.device)
+                    
+                    # Subsample if too many points to avoid OOM/slowdown
+                    # Target usually has ~20k-100k points. means2d similar.
+                    # We use a random subset for efficiency
+                    max_pts = 10000
+                    if means2d_norm.shape[0] > max_pts:
+                        idx = torch.randperm(means2d_norm.shape[0])[:max_pts]
+                        src_pts = means2d_norm[idx]
+                    else:
+                        src_pts = means2d_norm
+                        
+                    if target_xy.shape[0] > max_pts:
+                        idx = torch.randperm(target_xy.shape[0])[:max_pts]
+                        tgt_pts = target_xy[idx]
+                    else:
+                        tgt_pts = target_xy
+                        
+                    cd_loss = chamfer_distance(src_pts, tgt_pts)
+                    loss += cfg.instant_gi_lambda * cd_loss
+
             # regularizations
             if cfg.opacity_reg > 0.0:
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
@@ -720,6 +884,8 @@ class Runner:
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
+            if cfg.use_instant_gi and 'cd_loss' in locals():
+                desc += f"chamfer loss={cd_loss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
