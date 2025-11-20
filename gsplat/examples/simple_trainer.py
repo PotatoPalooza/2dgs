@@ -190,12 +190,10 @@ class Config:
 
     # Instant-GI integration
     use_instant_gi: bool = False
-    # Path to Instant-GI checkpoint
-    instant_gi_ckpt: Optional[str] = None
+    # Path to directory containing pre-computed Instant-GI splats
+    instant_gi_dir: Optional[str] = None
     # Weight for Chamfer distance loss
     instant_gi_lambda: float = 0.1
-    # Path to Instant-GI root directory (optional, defaults to assuming sibling directory)
-    instant_gi_root: Optional[str] = None
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -535,77 +533,36 @@ class Runner:
 
     def setup_instant_gi(self):
         cfg = self.cfg
-        print("Setting up Instant-GI...")
+        print("Setting up Instant-GI (loading pre-computed splats)...")
         
-        # Determine Instant-GI root
-        if cfg.instant_gi_root:
-            igi_root = Path(cfg.instant_gi_root).resolve()
-        else:
-            # Assume sibling directory
-            igi_root = Path(__file__).parent.parent.parent / "Instant-GI"
+        if not cfg.instant_gi_dir:
+            raise ValueError("Must provide --instant_gi_dir when using --use_instant_gi")
             
-        if not igi_root.exists():
-             raise FileNotFoundError(f"Instant-GI root not found at {igi_root}")
+        igi_dir = Path(cfg.instant_gi_dir)
+        if not igi_dir.exists():
+             raise FileNotFoundError(f"Instant-GI directory not found at {igi_dir}")
              
-        print(f"Instant-GI root: {igi_root}")
-        sys.path.append(str(igi_root))
+        print(f"Loading splats from: {igi_dir}")
         
-        try:
-            from generalizable_model.init_net import InitNet
-        except ImportError as e:
-            raise ImportError(f"Failed to import InitNet from {igi_root}. Make sure dependencies are installed.") from e
-
-        self.init_net = InitNet().to(self.device)
+        # Load all .pt files
+        # We assume filenames correspond to image IDs or indices.
+        # Since simple_trainer uses integer image IDs, we look for {image_id}.pt
+        # If not found, we might need a mapping. For now, assume {image_id}.pt
         
-        if cfg.instant_gi_ckpt:
-            print(f"Loading Instant-GI checkpoint from {cfg.instant_gi_ckpt}")
-            ckpt = torch.load(cfg.instant_gi_ckpt, map_location=self.device)
-            if "model" in ckpt:
-                self.init_net.load_state_dict(ckpt["model"])
-            else:
-                self.init_net.load_state_dict(ckpt)
-        else:
-            print("WARNING: No Instant-GI checkpoint provided. Using random initialization.")
-            
-        self.init_net.eval()
-        self.prepare_instant_gi_data()
-
-    def prepare_instant_gi_data(self):
-        print("Preparing Instant-GI data (generating 2D splats)...")
-        # Iterate over training images
-        # We need to access the dataset directly
-        
-        # Create a temporary loader to iterate once
-        loader = torch.utils.data.DataLoader(
-            self.trainset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=4
-        )
-        
-        with torch.no_grad():
-            for data in tqdm.tqdm(loader, desc="Instant-GI Init"):
-                image_id = data["image_id"].item()
-                # Image is [1, H, W, 3] in 0-255
-                # InitNet expects [1, 3, H, W] in 0-1 (check train_init_net.py)
-                # simple_trainer.py loads images as [H, W, 3] 0-255 in dataset, 
-                # but the collate_fn or just the loop converts them.
-                # In train loop: pixels = data["image"].to(device) / 255.0
+        count = 0
+        for file_path in igi_dir.glob("*.pt"):
+            try:
+                # Try to parse filename as integer image ID
+                image_id = int(file_path.stem)
+                self.instant_gi_data[image_id] = torch.load(file_path, map_location="cpu")
+                count += 1
+            except ValueError:
+                # Filename is not an integer, skip or handle differently
+                pass
                 
-                pixels = data["image"].to(self.device) / 255.0 # [1, H, W, 3]
-                pixels = pixels.permute(0, 3, 1, 2) # [1, 3, H, W]
-                
-                # InitNet forward with get_gaussians=True
-                # returns xy, scaling, rotation, color, triangles
-                # xy is [N, 2] in range [-1, 1]
-                
-                xy, _, _, _, _ = self.init_net(pixels, get_gaussians=True)
-                
-                # Store xy for this image
-                self.instant_gi_data[image_id] = xy.detach()
-                
-        print(f"Generated 2D splats for {len(self.instant_gi_data)} images.")
-
+        print(f"Loaded {count} splat files.")
+        if count == 0:
+            print("WARNING: No splat files loaded. Check filenames in instant_gi_dir.")
 
     def rasterize_splats(
         self,
