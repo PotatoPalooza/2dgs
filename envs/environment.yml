@@ -1,0 +1,8 @@
+name: instant-gi
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - libstdcxx-ng
+  - ipykernel
+prefix: /home/eric/miniconda3/envs/instant-gi
