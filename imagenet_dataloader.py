@@ -13,6 +13,8 @@ from pathlib import Path
 from tqdm import tqdm
 from typing import Optional
 
+DEFAULT_FIXED_SIZE = 512
+
 
 class ImageNetDataset(Dataset):
     """
@@ -40,8 +42,20 @@ class ImageNetDataset(Dataset):
         self.scale = scale
         self.load_gaussians = load_gaussians
         self.gaussian_dir = Path(gaussian_dir) if gaussian_dir else None
+
+        target_size = int(DEFAULT_FIXED_SIZE * self.scale)
+        self.transform = transforms.Compose([
+            # 1. Resize: Resizes the smaller edge of the image to 'target_size'
+            # This maintains aspect ratio and prepares for cropping.
+            transforms.Resize(target_size), 
+            # 2. CenterCrop: Crops the image centrally to the exact fixed size,
+            # ensuring all tensors in the batch are (C, H, W) where H=W=target_size.
+            transforms.CenterCrop(target_size),
+            # 3. ToTensor: Converts PIL image to torch.FloatTensor
+            transforms.ToTensor(), 
+        ])
         
-        self.transform = transforms.ToTensor()
+        # self.transform = transforms.ToTensor()
         
         # Find all image files
         split_dir = self.root_dir / split
@@ -72,19 +86,19 @@ class ImageNetDataset(Dataset):
         
         # Load image
         image = Image.open(image_path).convert("RGB")
-        if self.scale != 1.0:
-            image = image.resize((int(image.width * self.scale), int(image.height * self.scale)))
+        # if self.scale != 1.0:
+        #     image = image.resize((int(image.width * self.scale), int(image.height * self.scale)))
         
         image = self.transform(image)
+        gaussians = torch.empty(0)
         
         # Optionally load Gaussian splats
         if self.load_gaussians and self.gaussian_dir:
             gaussian_path = self.gaussian_dir / f"{image_path.stem}.pth"
             if gaussian_path.exists():
                 gaussians = torch.load(gaussian_path, map_location='cpu')
-                return image, gaussians
         
-        return image, None
+        return image, gaussians
 
 
 def download_imagenet(

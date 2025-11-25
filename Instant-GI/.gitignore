@@ -11,4 +11,3 @@ wandb/
 *build/
 *.egg-info/
 .vscode/
-*.sh
