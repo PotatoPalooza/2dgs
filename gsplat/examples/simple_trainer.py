@@ -55,6 +55,12 @@ class Config:
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
     data_factor: int = 4
+    # Optional directory containing per-image 2D Gaussian tensors (.pt) aligned with the images
+    gaussian_2d_dir: Optional[str] = None
+    # Weight for Chamfer distance to the provided 2D Gaussians
+    gaussian_2d_lambda: float = 0.1
+    # Maximum number of 2D Gaussians kept per set when computing Chamfer (subsampled for speed)
+    gaussian_2d_max_points: int = 8192
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -301,6 +307,170 @@ def create_splats_with_optimizers(
     return splats, optimizers
 
 
+class Gaussian2DPriors:
+    """Loads per-image 2D Gaussian priors and computes Chamfer loss."""
+
+    def __init__(
+        self,
+        root_dir: str,
+        parser: Parser,
+        trainset: Dataset,
+        max_points: int,
+    ):
+        self.root_dir = Path(root_dir)
+        self.max_points = max_points
+        self.cache: Dict[int, torch.Tensor] = {}
+        self.dataset_to_relpaths: Dict[int, List[Path]] = {}
+        self.dataset_to_name: Dict[int, str] = {}
+        self.missing_logged = set()
+
+        for ds_idx, parser_idx in enumerate(trainset.indices):
+            rel_path = Path(
+                os.path.relpath(parser.image_paths[parser_idx], parser.data_dir)
+            )
+            rel_pt = rel_path.with_suffix(".pt")
+            candidates = [rel_pt]
+            if rel_pt.parent.name.endswith("_png"):
+                candidates.append(
+                    rel_pt.parent.with_name(rel_pt.parent.name.replace("_png", ""))
+                    / rel_pt.name
+                )
+            self.dataset_to_relpaths[ds_idx] = candidates
+            self.dataset_to_name[ds_idx] = parser.image_names[parser_idx]
+
+    def _extract_xy(self, data: Union[torch.Tensor, Dict]) -> torch.Tensor:
+        tensor: Optional[torch.Tensor] = None
+        if isinstance(data, dict):
+            tensor = data.get("xy", None)
+        elif torch.is_tensor(data):
+            tensor = data
+        if tensor is None:
+            raise ValueError("The 2D Gaussian tensor must contain an 'xy' field.")
+        if tensor.dim() == 1:
+            tensor = tensor.view(1, -1)
+        if tensor.size(-1) != 2:
+            raise ValueError(
+                f"'xy' field must have shape (N, 2); got {tuple(tensor.shape)} instead."
+            )
+        return tensor.float()
+
+    def _maybe_subsample(self, points: torch.Tensor) -> torch.Tensor:
+        if (
+            self.max_points is not None
+            and self.max_points > 0
+            and points.shape[0] > self.max_points
+        ):
+            idx = torch.randperm(points.shape[0], device=points.device)[
+                : self.max_points
+            ]
+            points = points.index_select(0, idx)
+        return points
+
+    def _normalize(self, points: torch.Tensor, width: int, height: int) -> torch.Tensor:
+        if points.numel() == 0:
+            return points
+        w_denom = max(width - 1, 1)
+        h_denom = max(height - 1, 1)
+        x = points[:, 0] / w_denom * 2 - 1
+        y = points[:, 1] / h_denom * 2 - 1
+        return torch.stack([x, y], dim=-1)
+
+    def _load_xy(self, image_id: int) -> Optional[torch.Tensor]:
+        if image_id in self.cache:
+            return self.cache[image_id]
+        rel_paths = self.dataset_to_relpaths.get(image_id, [])
+        if len(rel_paths) == 0:
+            return None
+        last_error: Optional[str] = None
+        for rel_path in rel_paths:
+            abs_path = self.root_dir / rel_path
+            if not abs_path.exists():
+                last_error = str(abs_path)
+                continue
+            data = torch.load(abs_path, map_location="cpu")
+            xy = self._extract_xy(data)
+            self.cache[image_id] = xy
+            return xy
+
+        if last_error is not None:
+            attempted = ", ".join(str(self.root_dir / p) for p in rel_paths)
+            if attempted not in self.missing_logged:
+                self.missing_logged.add(attempted)
+                img_name = self.dataset_to_name.get(image_id, "unknown")
+                print(f"[2DGS] Missing prior tensor for {img_name}: {attempted}")
+        return None
+
+    def _select_projected(
+        self,
+        means2d: torch.Tensor,
+        radii: torch.Tensor,
+        batch_ids: Optional[torch.Tensor],
+        batch_index: int,
+        packed: bool,
+    ) -> torch.Tensor:
+        if packed:
+            mask = (radii > 0).all(dim=-1)
+            if batch_ids is not None:
+                mask = mask & (batch_ids == batch_index)
+            proj = means2d[mask]
+        else:
+            local_means = means2d[batch_index]
+            local_radii = radii[batch_index]
+            mask = (local_radii > 0).all(dim=-1)
+            proj = local_means.reshape(-1, 2)[mask.reshape(-1)]
+        return proj
+
+    def _chamfer(self, preds: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        preds = self._maybe_subsample(preds)
+        target = self._maybe_subsample(target)
+        if preds.numel() == 0 or target.numel() == 0:
+            return preds.new_tensor(0.0)
+        chunk = max(min(self.max_points, 2048), 1)
+
+        def _min_dists(a: torch.Tensor, b: torch.Tensor, dim: int) -> torch.Tensor:
+            mins = []
+            for start in range(0, a.shape[0], chunk):
+                dists = torch.cdist(a[start : start + chunk], b)
+                mins.append(dists.min(dim=dim).values)
+            return torch.cat(mins, dim=0)
+
+        min_pred = _min_dists(preds, target, dim=1)
+        min_target = _min_dists(target, preds, dim=0)
+        return 0.5 * (min_pred.mean() + min_target.mean())
+
+    def chamfer_loss(
+        self,
+        info: Dict,
+        image_ids: torch.Tensor,
+        width: int,
+        height: int,
+        packed: bool,
+        device: Union[torch.device, str],
+    ) -> Optional[torch.Tensor]:
+        ids = torch.as_tensor(image_ids, device="cpu").flatten().tolist()
+        means2d = info["means2d"]
+        radii = info["radii"]
+        batch_ids = info.get("batch_ids", None)
+
+        losses = []
+        for batch_index, img_id in enumerate(ids):
+            target_xy = self._load_xy(img_id)
+            if target_xy is None:
+                continue
+            target_xy = target_xy.to(device, non_blocking=True)
+            proj = self._select_projected(means2d, radii, batch_ids, batch_index, packed)
+            if proj.numel() == 0:
+                continue
+            # Convert projected pixels to the [-1, 1] space used by Instant-GI init_net.
+            proj = self._normalize(proj, width, height)
+            loss = self._chamfer(proj, target_xy)
+            losses.append(loss)
+
+        if len(losses) == 0:
+            return None
+        return torch.stack(losses).mean()
+
+
 class Runner:
     """Engine for training and testing."""
 
@@ -347,6 +517,27 @@ class Runner:
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
+
+        self.gaussian2d_priors = None
+        if cfg.gaussian_2d_dir is not None:
+            if os.path.isdir(cfg.gaussian_2d_dir):
+                self.gaussian2d_priors = Gaussian2DPriors(
+                    cfg.gaussian_2d_dir,
+                    self.parser,
+                    self.trainset,
+                    cfg.gaussian_2d_max_points,
+                )
+                print(f"Using 2D Gaussian priors from {cfg.gaussian_2d_dir}")
+            else:
+                print(
+                    f"Warning: gaussian_2d_dir={cfg.gaussian_2d_dir} "
+                    "does not exist. Chamfer loss is disabled."
+                )
+            if cfg.gaussian_2d_dir is not None and cfg.patch_size is not None:
+                print(
+                    "Warning: Chamfer loss uses full-image priors; random cropping "
+                    "via patch_size may misalign the priors."
+                )
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -680,12 +871,25 @@ class Runner:
                 info=info,
             )
 
+            chamferloss = None
+            if self.gaussian2d_priors is not None:
+                chamferloss = self.gaussian2d_priors.chamfer_loss(
+                    info=info,
+                    image_ids=image_ids,
+                    width=width,
+                    height=height,
+                    packed=self.cfg.packed,
+                    device=self.device,
+                )
+
             # loss
             l1loss = F.l1_loss(colors, pixels)
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            if chamferloss is not None:
+                loss += chamferloss * cfg.gaussian_2d_lambda
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -720,6 +924,8 @@ class Runner:
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
+            if chamferloss is not None:
+                desc += f"chamfer={chamferloss.item():.4f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -742,6 +948,8 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
+                if chamferloss is not None:
+                    self.writer.add_scalar("train/chamferloss", chamferloss.item(), step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.use_bilateral_grid:
@@ -1199,6 +1407,9 @@ if __name__ == "__main__":
 
     # Distributed training on 4 GPUs: Effectively 4x batch size so run 4x less steps.
     CUDA_VISIBLE_DEVICES=0,1,2,3 python simple_trainer.py default --steps_scaler 0.25
+
+    # Train with Instant-GI 2D Gaussian priors (per-image .pt files)
+    python -m examples.simple_trainer default --gaussian_2d_dir /path/to/priors --gaussian_2d_lambda 0.1
 
     """
 
