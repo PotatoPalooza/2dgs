@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+import cv2
 import imageio
 import numpy as np
 import torch
@@ -58,9 +59,11 @@ class Config:
     # Optional directory containing per-image 2D Gaussian tensors (.pt) aligned with the images
     gaussian_2d_dir: Optional[str] = None
     # Weight for Chamfer distance to the provided 2D Gaussians
-    gaussian_2d_lambda: float = 0.1
+    gaussian_2d_lambda: float = 0.0
     # Maximum number of 2D Gaussians kept per set when computing Chamfer (subsampled for speed)
     gaussian_2d_max_points: int = 8192
+    # Maximum pixel radius when lifting 2D priors into 3D for initialization
+    gaussian_2d_lift_radius: float = 4.0
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -95,7 +98,7 @@ class Config:
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
 
-    # Initialization strategy
+    # Initialization strategy ['sfm', 'random', 'gaussian_2d']
     init_type: str = "sfm"
     # Initial number of GSs. Ignored if using sfm
     init_num_pts: int = 100_000
@@ -236,6 +239,8 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    gaussian2d_priors = None,
+    gaussian_2d_lift_radius: float = 4.0,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -243,8 +248,17 @@ def create_splats_with_optimizers(
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
+    elif init_type == "gaussian_2d":
+        if gaussian2d_priors is None:
+            raise ValueError(
+                "init_type='gaussian_2d' requires gaussian_2d_dir with saved priors."
+            )
+        points, rgbs = lift_gaussian2d_priors_to_world(
+            parser, gaussian2d_priors, pixel_radius=gaussian_2d_lift_radius
+        )
+        print("Using 2d gaussian priors for initialization, lifted %d points." % points.shape[0])
     else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
+        raise ValueError("Please specify a correct init_type: sfm, random, or gaussian_2d")
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -322,6 +336,7 @@ class Gaussian2DPriors:
         self.cache: Dict[int, torch.Tensor] = {}
         self.dataset_to_relpaths: Dict[int, List[Path]] = {}
         self.dataset_to_name: Dict[int, str] = {}
+        self.dataset_to_parser_idx: Dict[int, int] = {}
         self.missing_logged = set()
 
         for ds_idx, parser_idx in enumerate(trainset.indices):
@@ -337,6 +352,7 @@ class Gaussian2DPriors:
                 )
             self.dataset_to_relpaths[ds_idx] = candidates
             self.dataset_to_name[ds_idx] = parser.image_names[parser_idx]
+            self.dataset_to_parser_idx[ds_idx] = parser_idx
 
     def _extract_xy(self, data: Union[torch.Tensor, Dict]) -> torch.Tensor:
         tensor: Optional[torch.Tensor] = None
@@ -374,6 +390,17 @@ class Gaussian2DPriors:
         x = points[:, 0] / w_denom * 2 - 1
         y = points[:, 1] / h_denom * 2 - 1
         return torch.stack([x, y], dim=-1)
+
+    def _denormalize(self, points: torch.Tensor, width: int, height: int) -> torch.Tensor:
+        if points.numel() == 0:
+            return points
+        if points.min() >= -1.01 and points.max() <= 1.01:
+            w_denom = max(width - 1, 1)
+            h_denom = max(height - 1, 1)
+            x = (points[:, 0] + 1.0) * 0.5 * w_denom
+            y = (points[:, 1] + 1.0) * 0.5 * h_denom
+            return torch.stack([x, y], dim=-1)
+        return points
 
     def _load_xy(self, image_id: int) -> Optional[torch.Tensor]:
         if image_id in self.cache:
@@ -471,6 +498,148 @@ class Gaussian2DPriors:
         return torch.stack(losses).mean()
 
 
+def _load_full_image(parser: Parser, parser_idx: int) -> torch.Tensor:
+    image = imageio.imread(parser.image_paths[parser_idx])[..., :3]
+    camera_id = parser.camera_ids[parser_idx]
+    params = parser.params_dict[camera_id]
+    if len(params) > 0:
+        mapx = parser.mapx_dict[camera_id]
+        mapy = parser.mapy_dict[camera_id]
+        image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+        x, y, w, h = parser.roi_undist_dict[camera_id]
+        image = image[y : y + h, x : x + w]
+    return torch.from_numpy(image).float() / 255.0
+
+
+def _project_sfm_points(
+    parser: Parser, parser_idx: int
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    image_name = parser.image_names[parser_idx]
+    point_indices = parser.point_indices.get(image_name)
+    if point_indices is None or len(point_indices) == 0:
+        return None
+
+    points_world = parser.points[point_indices]
+    camera_id = parser.camera_ids[parser_idx]
+    camtoworld = parser.camtoworlds[parser_idx]
+    worldtocam = np.linalg.inv(camtoworld)
+    points_cam = (worldtocam[:3, :3] @ points_world.T + worldtocam[:3, 3:4]).T
+    depths = points_cam[:, 2]
+    valid = depths > 0
+    if not np.any(valid):
+        return None
+
+    points_cam = points_cam[valid]
+    depths = depths[valid]
+
+    K = parser.Ks_dict[camera_id]
+    proj = (K @ points_cam.T).T
+    pixels = proj[:, :2] / proj[:, 2:3]
+    width, height = parser.imsize_dict[camera_id]
+    mask = (
+        (pixels[:, 0] >= 0)
+        & (pixels[:, 0] < width)
+        & (pixels[:, 1] >= 0)
+        & (pixels[:, 1] < height)
+    )
+    if not np.any(mask):
+        return None
+
+    pixels = torch.from_numpy(pixels[mask]).float()
+    depths = torch.from_numpy(depths[mask]).float()
+    camtoworld = torch.from_numpy(camtoworld).float()
+    K = torch.from_numpy(K).float()
+    return pixels, depths, camtoworld, K
+
+
+def _nearest_depths(
+    xy_pixels: torch.Tensor, ref_pixels: torch.Tensor, chunk: int = 2048
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    mins: List[torch.Tensor] = []
+    indices: List[torch.Tensor] = []
+    for start in range(0, xy_pixels.shape[0], chunk):
+        subset = xy_pixels[start : start + chunk]
+        dists = torch.cdist(subset, ref_pixels)
+        min_vals, min_idx = dists.min(dim=1)
+        mins.append(min_vals)
+        indices.append(min_idx)
+    return torch.cat(mins, dim=0), torch.cat(indices, dim=0)
+
+
+def _backproject_pixels(
+    xy_pixels: torch.Tensor,
+    depths: torch.Tensor,
+    K: torch.Tensor,
+    camtoworld: torch.Tensor,
+) -> torch.Tensor:
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    x = (xy_pixels[:, 0] - cx) / fx * depths
+    y = (xy_pixels[:, 1] - cy) / fy * depths
+    cam_points = torch.stack([x, y, depths], dim=-1)
+    R = camtoworld[:3, :3]
+    t = camtoworld[:3, 3]
+    world = cam_points @ R.T + t
+    return world
+
+
+def _sample_image_colors(image: torch.Tensor, xy_pixels: torch.Tensor) -> torch.Tensor:
+    height, width = image.shape[:2]
+    xs = xy_pixels[:, 0].round().clamp(0, width - 1).long()
+    ys = xy_pixels[:, 1].round().clamp(0, height - 1).long()
+    return image[ys, xs]
+
+
+def lift_gaussian2d_priors_to_world(
+    parser: Parser,
+    priors: Gaussian2DPriors,
+    pixel_radius: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    lifted_points: List[torch.Tensor] = []
+    lifted_colors: List[torch.Tensor] = []
+
+    for ds_idx, parser_idx in priors.dataset_to_parser_idx.items():
+        xy = priors._load_xy(ds_idx)
+        if xy is None:
+            continue
+        xy = priors._maybe_subsample(xy)
+        if xy.numel() == 0:
+            continue
+
+        camera_id = parser.camera_ids[parser_idx]
+        width, height = parser.imsize_dict[camera_id]
+        xy_pixels = priors._denormalize(xy, width, height)
+        projected = _project_sfm_points(parser, parser_idx)
+        if projected is None:
+            continue
+        pixels, depths, camtoworld, K = projected
+        if pixels.numel() == 0:
+            continue
+
+        min_dists, nn_idx = _nearest_depths(xy_pixels, pixels)
+        if pixel_radius > 0:
+            keep = min_dists <= pixel_radius
+            if keep.sum() == 0:
+                continue
+            xy_pixels = xy_pixels[keep]
+            nn_idx = nn_idx[keep]
+            depths = depths[nn_idx]
+        else:
+            depths = depths[nn_idx]
+
+        world = _backproject_pixels(xy_pixels, depths, K, camtoworld)
+        image = _load_full_image(parser, parser_idx)
+        colors = _sample_image_colors(image, xy_pixels)
+        lifted_points.append(world)
+        lifted_colors.append(colors)
+
+    if len(lifted_points) == 0:
+        raise ValueError(
+            "No valid 2D Gaussian priors could be lifted into 3D points."
+        )
+    return torch.cat(lifted_points, dim=0), torch.cat(lifted_colors, dim=0)
+
+
 class Runner:
     """Engine for training and testing."""
 
@@ -563,6 +732,8 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            gaussian2d_priors=self.gaussian2d_priors,
+            gaussian_2d_lift_radius=cfg.gaussian_2d_lift_radius,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -1410,6 +1581,9 @@ if __name__ == "__main__":
 
     # Train with Instant-GI 2D Gaussian priors (per-image .pt files)
     python -m examples.simple_trainer default --gaussian_2d_dir /path/to/priors --gaussian_2d_lambda 0.1
+
+    # Initialize the point cloud directly from 2D priors
+    python -m examples.simple_trainer default --init_type gaussian_2d --gaussian_2d_dir /path/to/priors
 
     """
 
