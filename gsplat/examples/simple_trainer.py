@@ -61,7 +61,7 @@ class Config:
     # Weight for Chamfer distance to the provided 2D Gaussians
     gaussian_2d_lambda: float = 0.0
     # Maximum number of 2D Gaussians kept per set when computing Chamfer (subsampled for speed)
-    gaussian_2d_max_points: int = 8192
+    gaussian_2d_max_points: int = 10_000
     # Maximum pixel radius when lifting 2D priors into 3D for initialization
     gaussian_2d_lift_radius: float = 4.0
     # Directory to save results
@@ -256,6 +256,11 @@ def create_splats_with_optimizers(
         points, rgbs = lift_gaussian2d_priors_to_world(
             parser, gaussian2d_priors, pixel_radius=gaussian_2d_lift_radius
         )
+        # Randomly sample if too many points with init_num_pts as upper bound
+        if points.shape[0] > init_num_pts:
+            idx = torch.randperm(points.shape[0], device=points.device)[:init_num_pts]
+            points = points.index_select(0, idx)
+            rgbs = rgbs.index_select(0, idx)
         print("Using 2d gaussian priors for initialization, lifted %d points." % points.shape[0])
     else:
         raise ValueError("Please specify a correct init_type: sfm, random, or gaussian_2d")
@@ -602,7 +607,7 @@ def lift_gaussian2d_priors_to_world(
         xy = priors._load_xy(ds_idx)
         if xy is None:
             continue
-        xy = priors._maybe_subsample(xy)
+        #xy = priors._maybe_subsample(xy)
         if xy.numel() == 0:
             continue
 
