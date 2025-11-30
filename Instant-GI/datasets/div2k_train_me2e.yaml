@@ -1,0 +1,44 @@
+mode: train
+dataset:
+  dataset_name: div2k
+  train_dir: ./data/div2k_gs/train
+  valid_dir: ./data/div2k_gs/valid
+  scale: 1.0
+  batch_size: 2
+  patch_sampling:
+    train:
+      enabled: true
+      patch_size: 192
+      patches_per_image: 2
+      scales: []          # empty list = no multi-scale sampling; fill to enable scale jitter
+      shuffle: true
+      samples_per_epoch: null
+    valid:
+      enabled: true
+      patch_size: 192
+      patches_per_image: 1
+      scales: []
+      shuffle: false
+      samples_per_epoch: null
+
+model:
+  min_scale: 0.01
+  max_scale: 0.25
+  max_offset: 1.25
+  min_opacity: 0.05
+  default_opacity: 0.6
+  backbone_pretrained: true
+  freeze_backbone: false
+
+train:
+  epochs: 60
+  lr: 0.001
+  lr_min: 0.00005
+  checkpoints_dir: ./checkpoints/train_me2e
+  resume: false
+  resume_checkpoint: ./checkpoints/train_me2e_last/epoch_last.pth
+  seed: 42
+  gaussian_reg_weight: 0.05
+  grad_clip_norm: 5.0
+  log_interval: 10
+  use_wandb: true

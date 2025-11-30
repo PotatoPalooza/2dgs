@@ -102,12 +102,13 @@ class RGBLoss(nn.Module):
         self.ssim = SSIM(size_average=False)
 
     def forward(self, pred, target, weight):
+        weight_expanded = weight.unsqueeze(1)
         mse_loss = F.mse_loss(pred, target, reduction='none')
-        mse_loss = mse_loss * weight.unsqueeze(1)
+        mse_loss = mse_loss * weight_expanded
         mse_loss = mse_loss.mean()
 
         ssim_loss = 1 - self.ssim(pred, target)
-        ssim_loss = ssim_loss * weight
+        ssim_loss = ssim_loss * weight_expanded
         ssim_loss = ssim_loss.mean()
 
         loss = self.lambda_val * mse_loss + (1 - self.lambda_val) * ssim_loss

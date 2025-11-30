@@ -1,0 +1,41 @@
+mode: train
+dataset:
+  dataset_name: div2k
+  train_dir: ./data/div2k_gs/train
+  valid_dir: ./data/div2k_gs/valid
+  scale: 0.25
+  batch_size: 8
+  patch_sampling:
+    train:
+      enabled: true
+      patch_size: 256
+      scales: [0.25, 0.5]
+      patches_per_image: 4
+      shuffle: true
+    valid:
+      enabled: false
+
+train:
+  epochs: 100
+  lr: 0.001
+  lr_min: 0.00001
+  pretrained: False
+  checkpoints_dir: ./checkpoints/train_e2e
+  resume: False
+  resume_checkpoint: ./checkpoints/train_e2e_last/epoch_last.pth
+  seed: 42
+  gaussian_reg_weight: 0.05   # weight for gaussian regularization loss
+  # End-to-end gaussian compression controls
+  train_keep_ratio: 0.5      # ratio of gaussians to keep (differentiable top-k) during training
+  infer_keep_ratio: 0.1      # ratio to keep at inference if top_k is not set
+  infer_top_k: null          # integer to force a fixed number of gaussians at inference (overrides ratio)
+  infer_threshold: null       # optional probability threshold for inference pruning
+  grad_clip_norm: 5.0        # clip gradients to this L2 norm to avoid explosions
+  max_gaussian_scale: 0.4    # differentiable upper bound for gaussian scales (normalized coords)
+
+  debug:
+    enabled: true
+    gaussian_stats_interval: 25
+    grad_vanish_threshold: 1e-6
+    grad_explode_threshold: 5e2
+    validation_image_count: 6

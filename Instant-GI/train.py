@@ -35,7 +35,7 @@ def image_path_to_tensor(image_path: Path):
 @torch.no_grad()
 def init_from_net(image, model):
     t_1 = time.time()
-    xy, scale, rotation, color, _ = model(image, get_gaussians=True)
+    xy, scale, rotation, color, _opacity, _ = model(image, get_gaussians=True)
     t_2 = time.time()
     print("Init time: ", t_2 - t_1)
     xy = xy.cpu().numpy()
