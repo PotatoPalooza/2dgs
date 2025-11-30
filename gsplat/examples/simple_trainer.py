@@ -1,11 +1,12 @@
 import json
 import math
 import os
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import cv2
 import imageio
@@ -40,6 +41,23 @@ from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
+try:
+    from depth import create_depth_estimator
+except ModuleNotFoundError:
+    repo_root = Path(__file__).resolve().parents[2]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    try:
+        from depth import create_depth_estimator  # type: ignore
+    except ModuleNotFoundError:
+        create_depth_estimator = None  # type: ignore
+
+if TYPE_CHECKING:
+    try:
+        from depth import DepthEstimator
+    except ModuleNotFoundError:
+        DepthEstimator = Any  # type: ignore
+
 
 @dataclass
 class Config:
@@ -64,6 +82,22 @@ class Config:
     gaussian_2d_max_points: int = 10_000
     # Maximum pixel radius when lifting 2D priors into 3D for initialization
     gaussian_2d_lift_radius: float = 4.0
+    # Lift 2D priors with a learned depth model instead of SfM sparse points
+    gaussian_2d_use_depth_model: bool = False
+    # HuggingFace model id to use for depth prediction
+    depth_model_id: str = "depth-anything/Depth-Anything-V2-Small-hf"
+    # Device hint for the depth model ("auto", "cpu", "cuda", "cuda:1", ...)
+    depth_model_device: str = "auto"
+    # Optional cache directory for downloaded depth checkpoints
+    depth_model_cache_dir: Optional[str] = None
+    # Optional manual depth scaling bounds (in scene units)
+    depth_model_min_depth: Optional[float] = None
+    depth_model_max_depth: Optional[float] = None
+    # Normalize each predicted map to [0, 1] before scaling to the depth bounds
+    depth_model_normalize_each: bool = True
+    # Dump predicted depth maps for debugging
+    depth_model_debug: bool = False
+    depth_model_debug_dir: Optional[str] = None
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -239,8 +273,13 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
-    gaussian2d_priors = None,
+    gaussian2d_priors=None,
     gaussian_2d_lift_radius: float = 4.0,
+    depth_model: Optional["DepthEstimator"] = None,
+    depth_cache: Optional[Dict[int, torch.Tensor]] = None,
+    gaussian_2d_depth_bounds: Optional[Tuple[float, float]] = None,
+    depth_normalize_each: bool = True,
+    depth_debug_dir: Optional[str] = None,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -254,7 +293,14 @@ def create_splats_with_optimizers(
                 "init_type='gaussian_2d' requires gaussian_2d_dir with saved priors."
             )
         points, rgbs = lift_gaussian2d_priors_to_world(
-            parser, gaussian2d_priors, pixel_radius=gaussian_2d_lift_radius
+            parser,
+            gaussian2d_priors,
+            pixel_radius=gaussian_2d_lift_radius,
+            depth_model=depth_model,
+            depth_cache=depth_cache,
+            depth_bounds=gaussian_2d_depth_bounds,
+            depth_normalize_each=depth_normalize_each,
+            depth_debug_dir=depth_debug_dir,
         )
         # Randomly sample if too many points with init_num_pts as upper bound
         if points.shape[0] > init_num_pts:
@@ -595,10 +641,256 @@ def _sample_image_colors(image: torch.Tensor, xy_pixels: torch.Tensor) -> torch.
     return image[ys, xs]
 
 
+def _estimate_scene_depth_range(parser: Parser, scene_scale: float) -> Tuple[float, float]:
+    bounds = getattr(parser, "bounds", None)
+    if bounds is not None:
+        arr = np.asarray(bounds)
+        if arr.ndim == 2 and arr.size > 0:
+            lo = float(np.percentile(arr[:, 0], 5))
+            hi = float(np.percentile(arr[:, 1], 95))
+            if math.isfinite(lo) and math.isfinite(hi) and hi > lo:
+                return lo, hi
+        elif arr.ndim == 1 and arr.size >= 2:
+            lo = float(arr[0])
+            hi = float(arr[-1])
+            if math.isfinite(lo) and math.isfinite(hi) and hi > lo:
+                return lo, hi
+
+    points = getattr(parser, "points", None)
+    if points is not None and len(points) > 0:
+        scene_center = parser.camtoworlds[:, :3, 3].mean(axis=0)
+        radial = np.linalg.norm(points - scene_center[None, :], axis=1)
+        lo, hi = np.percentile(radial, [5, 99])
+        if math.isfinite(lo) and math.isfinite(hi) and hi > lo:
+            return float(lo), float(hi)
+
+    base_min = max(scene_scale * 0.05, 1e-3)
+    base_max = max(scene_scale * 2.0, base_min + 1.0)
+    return base_min, base_max
+
+
+def _ensure_depth_resolution(depth: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
+    depth2d = depth
+    if depth2d.dim() == 3:
+        depth2d = depth2d.squeeze()
+    if depth2d.shape == torch.Size(target_hw):
+        return depth2d
+    if depth2d.dim() != 2:
+        raise ValueError(f"Unexpected depth map shape: {tuple(depth2d.shape)}")
+    depth_tensor = depth2d.view(1, 1, *depth2d.shape)
+    depth_resized = F.interpolate(
+        depth_tensor, size=target_hw, mode="bilinear", align_corners=True
+    )
+    return depth_resized.view(*target_hw)
+
+
+def _rescale_depth_map(
+    depth_map: torch.Tensor,
+    bounds: Tuple[float, float],
+    normalize_each: bool,
+) -> Optional[torch.Tensor]:
+    depth = depth_map.to(torch.float32)
+    min_depth, max_depth = bounds
+    if normalize_each:
+        depth = depth - depth.amin()
+    spread = depth.amax().item()
+    if not math.isfinite(spread) or spread <= 1e-6:
+        return None
+    depth = depth / spread
+    scaled = depth * (max_depth - min_depth) + min_depth
+    return scaled.clamp(min=min_depth, max=max_depth)
+
+
+def _sample_depth_from_map(
+    depth_map: torch.Tensor, xy_pixels: torch.Tensor
+) -> torch.Tensor:
+    if xy_pixels.numel() == 0:
+        return xy_pixels.new_zeros((0,), dtype=depth_map.dtype)
+    height, width = depth_map.shape[-2], depth_map.shape[-1]
+    w_denom = max(width - 1, 1)
+    h_denom = max(height - 1, 1)
+    coords = xy_pixels.to(depth_map.device, dtype=depth_map.dtype)
+    norm_x = coords[:, 0] / w_denom * 2 - 1
+    norm_y = coords[:, 1] / h_denom * 2 - 1
+    grid = torch.stack([norm_x, norm_y], dim=-1).view(1, -1, 1, 2)
+    depth_tensor = depth_map.view(1, 1, height, width)
+    samples = F.grid_sample(
+        depth_tensor,
+        grid,
+        mode="bilinear",
+        align_corners=True,
+        padding_mode="border",
+    )
+    return samples.view(-1).cpu()
+
+
+def _calibrate_depth_scale(
+    depth_map: torch.Tensor,
+    ref_pixels: torch.Tensor,
+    ref_depths: torch.Tensor,
+) -> Optional[float]:
+    if ref_pixels is None or ref_depths is None or ref_pixels.numel() == 0:
+        return None
+    predicted = _sample_depth_from_map(depth_map, ref_pixels)
+    if predicted.numel() == 0:
+        return None
+    ref = ref_depths.to(predicted.device)
+    mask = (
+        torch.isfinite(predicted)
+        & torch.isfinite(ref)
+        & (predicted > 1e-4)
+        & (ref > 1e-4)
+    )
+    if mask.sum() < 16:
+        return None
+    ratios = ref[mask] / predicted[mask]
+    ratios = ratios[torch.isfinite(ratios) & (ratios > 1e-6)]
+    if ratios.numel() == 0:
+        return None
+    scale = ratios.median().item()
+    if not math.isfinite(scale) or scale <= 0:
+        return None
+    return scale
+
+
+def _fit_depth_affine(
+    depth_map: torch.Tensor,
+    ref_pixels: torch.Tensor,
+    ref_depths: torch.Tensor,
+) -> Optional[Tuple[float, float]]:
+    if ref_pixels is None or ref_depths is None or ref_pixels.numel() == 0:
+        return None
+    predicted = _sample_depth_from_map(depth_map, ref_pixels)
+    if predicted.numel() == 0:
+        return None
+    ref = ref_depths.to(predicted.device)
+    mask = (
+        torch.isfinite(predicted)
+        & torch.isfinite(ref)
+        & (predicted > 1e-4)
+        & (ref > 1e-4)
+    )
+    if mask.sum() < 32:
+        return None
+    pred = predicted[mask]
+    tgt = ref[mask]
+    if pred.numel() > 4096:
+        idx = torch.randperm(pred.numel(), device=pred.device)[:4096]
+        pred = pred[idx]
+        tgt = tgt[idx]
+    A = torch.stack([pred, torch.ones_like(pred)], dim=1).double().cpu().numpy()
+    b = tgt.double().cpu().numpy()
+    try:
+        sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    scale, bias = sol
+    if not np.isfinite(scale) or not np.isfinite(bias):
+        return None
+    if scale <= 0:
+        return None
+    return float(scale), float(bias)
+
+
+def _dump_depth_debug(
+    depth_map: torch.Tensor,
+    debug_dir: str,
+    image_name: str,
+    image_index: int,
+    mode: str,
+) -> None:
+    debug_path = Path(debug_dir)
+    debug_path.mkdir(parents=True, exist_ok=True)
+    arr = depth_map.detach().cpu().numpy()
+    arr_min = float(np.min(arr))
+    arr_max = float(np.max(arr))
+    arr_mean = float(np.mean(arr))
+    arr_median = float(np.median(arr))
+    safe_name = Path(image_name).stem
+    prefix = f"{image_index:05d}_{safe_name}"
+    npy_path = debug_path / f"{prefix}.npy"
+    png_path = debug_path / f"{prefix}.png"
+    np.save(npy_path, arr)
+    denom = arr_max - arr_min
+    if denom <= 1e-6:
+        norm = np.zeros_like(arr, dtype=np.float32)
+    else:
+        norm = (arr - arr_min) / denom
+    imageio.imwrite(png_path, (norm * 65535.0).astype(np.uint16))
+    print(
+        f"[DepthDebug] {prefix} ({mode}) min={arr_min:.4f} max={arr_max:.4f} "
+        f"mean={arr_mean:.4f} median={arr_median:.4f}"
+    )
+
+
+def _predict_depth_map_for_image(
+    parser: Parser,
+    parser_idx: int,
+    image: torch.Tensor,
+    depth_model: "DepthEstimator",
+    depth_cache: Optional[Dict[int, torch.Tensor]],
+    bounds: Tuple[float, float],
+    normalize_each: bool,
+    reference_pixels: Optional[torch.Tensor] = None,
+    reference_depths: Optional[torch.Tensor] = None,
+    debug_dir: Optional[str] = None,
+    image_name: Optional[str] = None,
+    image_index: Optional[int] = None,
+) -> Optional[torch.Tensor]:
+    if depth_cache is not None and parser_idx in depth_cache:
+        return depth_cache[parser_idx]
+
+    try:
+        depth = depth_model.predict(image)
+    except Exception as exc:
+        name = parser.image_names[parser_idx]
+        print(f"[2DGS] Depth model failed for {name}: {exc}")
+        return None
+
+    depth = _ensure_depth_resolution(depth, image.shape[:2])
+
+    calibrated = False
+    if reference_pixels is not None and reference_depths is not None:
+        affine = _fit_depth_affine(depth, reference_pixels, reference_depths)
+        if affine is not None:
+            scale, bias = affine
+            depth = depth * scale + bias
+            calibrated = True
+        else:
+            scale_only = _calibrate_depth_scale(
+                depth, reference_pixels, reference_depths
+            )
+            if scale_only is not None:
+                depth = depth * scale_only
+                calibrated = True
+
+    if not calibrated:
+        depth = _rescale_depth_map(depth, bounds, normalize_each)
+        if depth is None:
+            return None
+    depth = depth.clamp(min=bounds[0], max=bounds[1])
+    if debug_dir is not None and image_name is not None and image_index is not None:
+        _dump_depth_debug(
+            depth,
+            debug_dir,
+            image_name,
+            image_index,
+            mode="calibrated" if calibrated else "normalized",
+        )
+    if depth_cache is not None:
+        depth_cache[parser_idx] = depth
+    return depth
+
+
 def lift_gaussian2d_priors_to_world(
     parser: Parser,
     priors: Gaussian2DPriors,
     pixel_radius: float,
+    depth_model: Optional["DepthEstimator"] = None,
+    depth_cache: Optional[Dict[int, torch.Tensor]] = None,
+    depth_bounds: Optional[Tuple[float, float]] = None,
+    depth_normalize_each: bool = True,
+    depth_debug_dir: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     lifted_points: List[torch.Tensor] = []
     lifted_colors: List[torch.Tensor] = []
@@ -614,26 +906,64 @@ def lift_gaussian2d_priors_to_world(
         camera_id = parser.camera_ids[parser_idx]
         width, height = parser.imsize_dict[camera_id]
         xy_pixels = priors._denormalize(xy, width, height)
-        projected = _project_sfm_points(parser, parser_idx)
-        if projected is None:
-            continue
-        pixels, depths, camtoworld, K = projected
-        if pixels.numel() == 0:
-            continue
-
-        min_dists, nn_idx = _nearest_depths(xy_pixels, pixels)
-        if pixel_radius > 0:
-            keep = min_dists <= pixel_radius
-            if keep.sum() == 0:
-                continue
-            xy_pixels = xy_pixels[keep]
-            nn_idx = nn_idx[keep]
-            depths = depths[nn_idx]
-        else:
-            depths = depths[nn_idx]
-
-        world = _backproject_pixels(xy_pixels, depths, K, camtoworld)
         image = _load_full_image(parser, parser_idx)
+        projected = _project_sfm_points(parser, parser_idx)
+
+        sampled_depths: Optional[torch.Tensor] = None
+        camtoworld: Optional[torch.Tensor] = None
+        K: Optional[torch.Tensor] = None
+
+        if depth_model is not None and depth_bounds is not None:
+            depth_map = _predict_depth_map_for_image(
+                parser,
+                parser_idx,
+                image,
+                depth_model,
+                depth_cache,
+                depth_bounds,
+                depth_normalize_each,
+                reference_pixels=projected[0] if projected is not None else None,
+                reference_depths=projected[1] if projected is not None else None,
+                debug_dir=depth_debug_dir,
+                image_name=parser.image_names[parser_idx],
+                image_index=parser_idx,
+            )
+            if depth_map is not None:
+                sampled_depths = _sample_depth_from_map(depth_map, xy_pixels)
+                valid = torch.isfinite(sampled_depths) & (sampled_depths > depth_bounds[0])
+                if valid.sum() == 0:
+                    sampled_depths = None
+                else:
+                    xy_pixels = xy_pixels[valid]
+                    sampled_depths = sampled_depths[valid]
+                    camtoworld = torch.from_numpy(parser.camtoworlds[parser_idx]).float()
+                    K = torch.from_numpy(parser.Ks_dict[camera_id]).float()
+
+        if sampled_depths is None:
+            if projected is None:
+                continue
+            pixels, depths, camtoworld_np, K_np = projected
+            if pixels.numel() == 0:
+                continue
+
+            min_dists, nn_idx = _nearest_depths(xy_pixels, pixels)
+            if pixel_radius > 0:
+                keep = min_dists <= pixel_radius
+                if keep.sum() == 0:
+                    continue
+                xy_pixels = xy_pixels[keep]
+                nn_idx = nn_idx[keep]
+                depths = depths[nn_idx]
+            else:
+                depths = depths[nn_idx]
+            sampled_depths = depths
+            camtoworld = camtoworld_np
+            K = K_np
+
+        if sampled_depths is None or camtoworld is None or K is None:
+            continue
+
+        world = _backproject_pixels(xy_pixels, sampled_depths.to(xy_pixels.dtype), K, camtoworld)
         colors = _sample_image_colors(image, xy_pixels)
         lifted_points.append(world)
         lifted_colors.append(colors)
@@ -692,6 +1022,52 @@ class Runner:
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
+        self.depth_estimator: Optional["DepthEstimator"] = None
+        self.depth_cache: Optional[Dict[int, torch.Tensor]] = None
+        self.depth_bounds: Optional[Tuple[float, float]] = None
+        self.depth_normalize_each = cfg.depth_model_normalize_each
+        self.depth_debug_dir: Optional[str] = None
+        if cfg.gaussian_2d_use_depth_model:
+            if create_depth_estimator is None:
+                raise RuntimeError(
+                    "Depth-model lifting requested, but the local 'gsplat.depth' module "
+                    "is unavailable. Ensure you are running from the gsplat repository "
+                    "root or reinstall the package with the latest sources."
+                )
+            self.depth_estimator = create_depth_estimator(
+                model_id=cfg.depth_model_id,
+                device=cfg.depth_model_device,
+                cache_dir=cfg.depth_model_cache_dir,
+            )
+            auto_min, auto_max = _estimate_scene_depth_range(
+                self.parser, self.scene_scale
+            )
+            min_depth = (
+                cfg.depth_model_min_depth
+                if cfg.depth_model_min_depth is not None
+                else max(cfg.near_plane, auto_min)
+            )
+            max_depth = (
+                cfg.depth_model_max_depth
+                if cfg.depth_model_max_depth is not None
+                else auto_max
+            )
+            if max_depth <= min_depth:
+                spread = max(auto_max - auto_min, self.scene_scale)
+                max_depth = min_depth + max(spread, 1e-3)
+            self.depth_bounds = (min_depth, max_depth)
+            self.depth_cache = {}
+            if cfg.depth_model_debug:
+                self.depth_debug_dir = cfg.depth_model_debug_dir or os.path.join(
+                    cfg.result_dir, "depth_debug"
+                )
+                os.makedirs(self.depth_debug_dir, exist_ok=True)
+            print(
+                f"Using depth model '{cfg.depth_model_id}' "
+                f"for gaussian lifting with depth range "
+                f"[{self.depth_bounds[0]:.3f}, {self.depth_bounds[1]:.3f}]."
+            )
+
         self.gaussian2d_priors = None
         if cfg.gaussian_2d_dir is not None:
             if os.path.isdir(cfg.gaussian_2d_dir):
@@ -739,6 +1115,11 @@ class Runner:
             world_size=world_size,
             gaussian2d_priors=self.gaussian2d_priors,
             gaussian_2d_lift_radius=cfg.gaussian_2d_lift_radius,
+            depth_model=self.depth_estimator,
+            depth_cache=self.depth_cache,
+            gaussian_2d_depth_bounds=self.depth_bounds,
+            depth_normalize_each=self.depth_normalize_each,
+            depth_debug_dir=self.depth_debug_dir,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -1589,6 +1970,9 @@ if __name__ == "__main__":
 
     # Initialize the point cloud directly from 2D priors
     python -m examples.simple_trainer default --init_type gaussian_2d --gaussian_2d_dir /path/to/priors
+
+    # Initialize from 2D priors and lift them with Depth Anything V2 (requires transformers)
+    python -m examples.simple_trainer default --init_type gaussian_2d --gaussian_2d_dir /path/to/priors --gaussian_2d_use_depth_model True --depth_model_id depth-anything/Depth-Anything-V2-Small-hf
 
     """
 
