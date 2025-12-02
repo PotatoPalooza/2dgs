@@ -71,10 +71,15 @@ class InitNet(nn.Module):
         self.knn_neighbors = max(1, neighbor_sample)
         self.sample_points = self.knn_neighbors + 1  # neighbors + center
         self.adjacent_count = min(3, self.knn_neighbors)
+
+        self.ell_process = EllipseProcessKNN(k=knn_k, sample_neighbors=self.knn_neighbors)
+
         self.feature_net = ConvNeXtUnet(
             out_channels=self.feature_dim, encoder_name='convnext_base',
             pretrained=True, in_22k=False, in_channels=3, bilinear=False
         )
+
+        
 
         self.position_field = nn.Sequential(
             nn.Linear(self.feature_dim, self.feature_dim),
@@ -99,6 +104,7 @@ class InitNet(nn.Module):
         neighbor_feature_dim = self.knn_neighbors * 2
         ell_feature_dim = 4
         self.mlp_dim = ell_feature_dim + neighbor_feature_dim + color_feature_dim + self.feature_dim
+        
 
         self.bc_field = nn.Sequential(
             nn.Linear(self.mlp_dim, self.mlp_dim),
@@ -129,7 +135,6 @@ class InitNet(nn.Module):
         )  # [N, 3]
 
         self.apply(self._init_weights)
-        self.ell_process = EllipseProcessKNN(k=knn_k, sample_neighbors=self.knn_neighbors)
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
@@ -155,12 +160,13 @@ class InitNet(nn.Module):
         color_feature = color_feature.view(-1, self.sample_points * 3)
         neighbor_feat = neighbor_offsets(e_center, neighbor_pts)  # [N, knn_neighbors * 2]
         ell_feature = torch.cat(
-            (e_center, (e_size[:, 0:1] / (e_size[:, 1:2] + 0.0001)), e_angle.unsqueeze(-1)),
+            (e_center, (e_size[:, 0:1] / (e_size[:, 1:2] + 1e-6)), e_angle.unsqueeze(-1)),
             dim=1
         )  # [N, 4]
 
         mlp_feature = torch.cat((ell_feature, neighbor_feat, color_feature, reduced_feature), dim=1)
 
+        # Coordinate refinement
         bc = self.bc_field(mlp_feature).unsqueeze(-1)  # [N, sample_points, 1]
         xy = torch.sum(bc * sample_points, dim=1)  # [N, 2]
         xy = torch.clamp(xy, -1 + 1e-6, 1 - 1e-6)
@@ -172,9 +178,12 @@ class InitNet(nn.Module):
 
         scale_rot = self.scale_rot_field(mlp_feature)  # [N, 3]
         scaling = scaling_activation(scale_rot[:, :2]) * e_size  # [N, 2]
+
         inv_e_angle = inv_sigmoid(e_angle.unsqueeze(-1))
         rotation = torch.tanh(scale_rot[:, 2:3]) + inv_e_angle  # [N, 1]
         rotation = torch.sigmoid(rotation)  # [N, 1]
+
+        # TODO simplify color reshaping
         sampled_color = F.grid_sample(
             image,
             xy.unsqueeze(0).unsqueeze(0).detach(),  # [1, 1, N, 2]
@@ -187,8 +196,8 @@ class InitNet(nn.Module):
         if get_gaussians:
             return xy, scaling, rotation, color, neighbor_pts
         else:
-            rotation = rotation * 2 * torch.pi
-            render_img = render(xy, scaling, rotation, color, H, W)["render"]
+            rot_rad = rotation * 2 * torch.pi
+            render_img = render(xy, scaling, rot_rad, color, H, W)["render"]
 
             # import matplotlib.pyplot as plt
             # plt.imshow(render_img[0].detach().cpu().numpy().transpose(1, 2, 0))
