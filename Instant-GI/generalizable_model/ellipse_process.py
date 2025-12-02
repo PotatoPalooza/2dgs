@@ -3,11 +3,13 @@ import os
 import numpy as np
 import torch
 from scipy.spatial import Delaunay
-from generalizable_model.utils import add_boundary_points, min_bounding_ellipse, dither_image, neighbors_process
+from generalizable_model.utils import add_boundary_points,add_boundary_points_torch, min_bounding_ellipse, dither_image, neighbors_process
 from ellipse_fit import fit_ellipses
 import cupy as cp
 from cupyx.scipy.spatial import Delaunay as DelaunayGPU
 import time
+import math
+
 
 # pool = None
 # def init_pool(cpu_num):
@@ -215,6 +217,7 @@ class EllipseProcessKNN:
         return cov
 
     def process(self, pf, kernel_size):
+        
         device = pf.device
         _, H, W = pf.shape
         sampled_xy = dither_image(pf, kernel_size=kernel_size)
@@ -223,6 +226,8 @@ class EllipseProcessKNN:
         points = sampled_xy.to(device=device, dtype=torch.float32)
         if points.shape[0] < 2:
             raise RuntimeError("Need at least two samples to compute KNN priors.")
+
+        points = add_boundary_points_torch(points, H, W)
 
         dist = torch.cdist(points, points, p=2)
         k_eff = min(self.k, max(points.shape[0] - 1, 1))
@@ -251,3 +256,145 @@ class EllipseProcessKNN:
         prior_scales = prior_scales * 0.5
 
         return centers_norm, neighbors_norm, prior_scales, angles, neighbor_idx_subset
+
+
+class EllipseProcessSoftKNN:
+    """
+    Differentiable Soft-KNN Prior. 
+    Calculates covariance and neighbors with soft-weighted attention,
+    ensuring gradients flow through point positions and features.
+    """
+    def __init__(self, k=6, sample_neighbors=3, temperature=0.1):
+        self.k = max(int(k), 2)
+        # We sample k neighbors for the covariance calculation, 
+        # but we might only return 'sample_neighbors' to the MLP to save memory.
+        self.sample_neighbors = max(int(sample_neighbors), 1)
+        self.temperature = temperature
+
+    def _normalize_points(self, pts, H, W):
+        # Normalize to [-1, 1] range for grid_sample compatibility
+        scale_param = torch.tensor([W, H], dtype=torch.float32, device=pts.device)
+        pts = pts / scale_param * 2 - 1
+        return torch.clamp(pts, -0.99999, 0.99999)
+
+    def _pad_neighbors(self, tensor, target_len):
+        if tensor.shape[1] >= target_len:
+            return tensor[:, :target_len]
+        pad_count = target_len - tensor.shape[1]
+        pad_slice = tensor[:, -1:].repeat(1, pad_count, 1)
+        return torch.cat([tensor, pad_slice], dim=1)
+
+    def _pad_indices(self, tensor, target_len):
+        if tensor.shape[1] >= target_len:
+            return tensor[:, :target_len]
+        pad_count = target_len - tensor.shape[1]
+        pad_slice = tensor[:, -1:].repeat(1, pad_count)
+        return torch.cat([tensor, pad_slice], dim=1)
+
+    def process(self, pf, kernel_size):
+        """
+        pf: Position Field / Probability Map [B, 1, H, W]
+        kernel_size: for the dithering step
+        """
+        device = pf.device
+        _, H, W = pf.shape
+        
+        # 1. Sampling (Assuming dither_image exists in your scope)
+        # This step is non-differentiable regarding the *number* of points,
+        # but subsequent operations are differentiable w.r.t their positions.
+        sampled_xy = dither_image(pf, kernel_size=kernel_size)
+        if sampled_xy.numel() == 0:
+            raise RuntimeError("No samples generated from the position field.")
+
+        points = sampled_xy.to(device=device, dtype=torch.float32)
+        if points.shape[0] < 2:
+            raise RuntimeError("Need at least two samples to compute KNN priors.")
+
+        points = add_boundary_points_torch(points, H, W)
+
+        # 2. Compute Distance Matrix (B, N, N) -> (N, N) since B=1 effectively here for points
+        # If you have batch size > 1, you need to loop or batch-process. 
+        # Assuming single image processing for now based on 'dither_image' usually returning 1 set.
+        dist = torch.cdist(points, points, p=2) # [N, N]
+
+        # 3. Find K Nearest Neighbors
+        # k_eff = K + 1 (including self)
+        k_eff = min(self.k + 1, points.shape[0])
+        
+        # knn_val: [N, k_eff], knn_idx: [N, k_eff]
+        knn_val, knn_idx = torch.topk(dist, k_eff, dim=1, largest=False)
+        
+        # Exclude self (first column) for the neighbor list
+        # But for covariance, we often include self or just use neighbors. 
+        # Let's use neighbors only for shape context.
+        neighbor_dists = knn_val[:, 1:] # [N, k]
+        neighbor_indices = knn_idx[:, 1:] # [N, k]
+        
+        # 4. Soft-Weighted Attention (The Fix)
+        # Weights decay as distance increases.
+        # [N, k]
+        local_scale = neighbor_dists.mean(dim=1, keepdim=True) + 1e-6
+        weights = torch.softmax(-neighbor_dists / (local_scale * self.temperature), dim=1)
+        # # weights = torch.ones_like(neighbor_dists) / neighbor_dists.shape[1]
+        
+        # Gather neighbor coordinates: [N, k, 2]
+        # Expand points to gather: [N, N, 2]
+        all_points_expanded = points.unsqueeze(0).expand(points.shape[0], -1, -1)
+        neighbors = torch.gather(
+            all_points_expanded, 
+            1, 
+            neighbor_indices.unsqueeze(-1).expand(-1, -1, 2)
+        )
+
+        # 5. Weighted Mean and Covariance
+        # Mean center of the neighborhood (Soft centroid)
+        # sum(w * x) -> [N, 1, 2]
+        soft_mean = (neighbors * weights.unsqueeze(-1)).sum(dim=1, keepdim=True)
+        
+        # Centered coordinates
+        centered = neighbors - soft_mean 
+        
+        # Weighted Covariance: sum(w * (x-u)(x-u)^T)
+        # [N, k, 2, 1] * [N, k, 1, 2] -> [N, k, 2, 2]
+        outer_prod = torch.matmul(centered.unsqueeze(-1), centered.unsqueeze(-2))
+        # Weighted sum -> [N, 2, 2]
+        cov = (outer_prod * weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+        
+        # 6. Eigendecomposition for Ellipse Parameters
+        # Add epsilon to diagonal for stability
+        cov = cov + torch.eye(2, device=device).unsqueeze(0) * 1e-6
+        
+        eigvals, eigvecs = torch.linalg.eigh(cov)
+        eigvals = torch.clamp(eigvals, min=1e-8)
+        
+        # Get major/minor axes
+        major = torch.sqrt(eigvals[:, 1])
+        minor = torch.sqrt(eigvals[:, 0])
+        prior_scales = torch.stack([major, minor], dim=1)
+        prior_scales = prior_scales * 0.5
+
+        # Get Angle
+        major_vec = eigvecs[:, :, 1] # Eigenvector corresponding to largest eigenvalue
+        angles = torch.atan2(major_vec[:, 1], major_vec[:, 0])
+        
+        # Normalize angle to [0, 1] for the network
+        angles = (angles / (2 * math.pi)) % 1.0
+        angles = torch.clamp(angles, 0.00001, 0.99999)
+        
+        # 7. Prepare outputs for MLP
+        # We need to return specific subsets for the neural net
+        
+        # Select closest neighbors for the "sample_points" input of the network
+        # usually we just take the top 'sample_neighbors' from our soft list
+        final_neighbors = self._pad_neighbors(neighbors, self.sample_neighbors)
+        final_indices = self._pad_indices(neighbor_indices, self.sample_neighbors).long()
+        
+        # Normalize for grid sampling features
+        centers_norm = self._normalize_points(points, H, W) # The actual points
+        neighbors_norm = self._normalize_points(final_neighbors.reshape(-1, 2), H, W)
+        neighbors_norm = neighbors_norm.view(points.shape[0], self.sample_neighbors, 2)
+        
+        # Note: We return 'points' as the center, but the ellipse properties 
+        # are derived from the 'soft_mean'. This gives us the residuals we need.
+        
+        return centers_norm, neighbors_norm, prior_scales, angles, final_indices
