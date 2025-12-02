@@ -1,11 +1,10 @@
 import cv2
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sympy import ceiling
 import torch.nn as nn
 from torch_dither import torch_image_dither
-from torch_kdtree import build_kd_tree
 from generalizable_model.ssim import SSIM
 
 def dither_image(position_field, kernel_size=3, image=None):
@@ -38,27 +37,34 @@ def min_bounding_ellipse(vertices):
     return center, axes, angle
 
 
-def add_boundary_points(points, H, W):
-    tree = build_kd_tree(points)
-    dist, idx = tree.query(points, 2)
-    dist = torch.sqrt(dist[:, 1])
-    mean_dist = dist.mean()
-    add_point_interval = 3 * mean_dist
-    points = points.cpu()
-    x_interval_num = int(ceiling(W / add_point_interval).evalf())
-    y_interval_num = int(ceiling(H / add_point_interval).evalf())
-    x_sample = torch.linspace(0, W - 1, steps=x_interval_num)
-    y_sample = torch.linspace(0, H - 1, steps=y_interval_num)
-    x_sample = x_sample.unsqueeze(1)
-    y_sample = y_sample.unsqueeze(1)
+def add_boundary_points_torch(points, H, W):
+    device = points.device
+    dtype = points.dtype
+    if points.shape[0] < 2:
+        mean_dist = torch.tensor(float(min(H, W)) / 2.0, device=device, dtype=dtype)
+    else:
+        dist = torch.cdist(points, points, p=2)
+        dist.fill_diagonal_(float("inf"))
+        nearest_dist = dist.min(dim=1).values
+        mean_dist = nearest_dist.mean()
+    add_point_interval = torch.clamp(3 * mean_dist, min=1.0)
+    interval = add_point_interval.item()
+    x_interval_num = max(2, int(math.ceil(W / interval)))
+    y_interval_num = max(2, int(math.ceil(H / interval)))
+    x_sample = torch.linspace(0, W - 1, steps=x_interval_num, device=device, dtype=dtype).unsqueeze(1)
+    y_sample = torch.linspace(0, H - 1, steps=y_interval_num, device=device, dtype=dtype).unsqueeze(1)
     new_points = torch.cat([x_sample, torch.zeros_like(x_sample)], dim=1)
     new_points = torch.cat([new_points, torch.cat([x_sample, torch.ones_like(x_sample) * (H - 1)], dim=1)], dim=0)
     new_points = torch.cat([new_points, torch.cat([torch.zeros_like(y_sample), y_sample], dim=1)], dim=0)
     new_points = torch.cat([new_points, torch.cat([torch.ones_like(y_sample) * (W - 1), y_sample], dim=1)], dim=0)
     points = torch.cat([points, new_points], dim=0)
     points = torch.unique(points, dim=0)
-    points = points.numpy()
     return points
+
+
+def add_boundary_points(points, H, W):
+    points = add_boundary_points_torch(points, H, W)
+    return points.cpu().numpy()
 
 
 def tri_area(tri):
