@@ -1,3 +1,4 @@
+import math
 import os
 import numpy as np
 import torch
@@ -174,3 +175,79 @@ class EllipseProcess:
         sampled_xy = dither_image(pf, kernel_size=kernel_size)
         elements = self.post_process(sampled_xy, H, W)
         return elements
+
+
+class EllipseProcessKNN:
+    """
+    Fully differentiable KNN-based prior extraction that operates on the GPU and
+    bypasses any Delaunay triangulation or CPU computations.
+    """
+
+    def __init__(self, k=6, sample_neighbors=3):
+        self.k = max(int(k), 2)
+        self.sample_neighbors = max(int(sample_neighbors), 1)
+
+    def _pad_neighbors(self, tensor, target_len):
+        if tensor.shape[1] >= target_len:
+            return tensor[:, :target_len]
+        pad_count = target_len - tensor.shape[1]
+        pad_slice = tensor[:, -1:].repeat(1, pad_count, 1)
+        return torch.cat([tensor, pad_slice], dim=1)
+
+    def _pad_indices(self, tensor, target_len):
+        if tensor.shape[1] >= target_len:
+            return tensor[:, :target_len]
+        pad_count = target_len - tensor.shape[1]
+        pad_slice = tensor[:, -1:].repeat(1, pad_count)
+        return torch.cat([tensor, pad_slice], dim=1)
+
+    def _normalize_points(self, pts, H, W):
+        scale_param = torch.tensor([W, H], dtype=torch.float32, device=pts.device)
+        pts = pts / scale_param * 2 - 1
+        pts = torch.clamp(pts, -0.99999, 0.99999)
+        return pts
+
+    def _compute_covariance(self, neighbors):
+        mean = neighbors.mean(dim=1, keepdim=True)
+        centered = neighbors - mean
+        denom = max(neighbors.shape[1] - 1, 1)
+        cov = torch.matmul(centered.transpose(1, 2), centered) / denom
+        return cov
+
+    def process(self, pf, kernel_size):
+        device = pf.device
+        _, H, W = pf.shape
+        sampled_xy = dither_image(pf, kernel_size=kernel_size)
+        if sampled_xy.numel() == 0:
+            raise RuntimeError("No samples generated from the position field.")
+        points = sampled_xy.to(device=device, dtype=torch.float32)
+        if points.shape[0] < 2:
+            raise RuntimeError("Need at least two samples to compute KNN priors.")
+
+        dist = torch.cdist(points, points, p=2)
+        k_eff = min(self.k, max(points.shape[0] - 1, 1))
+        knn_idx = torch.topk(dist, k_eff + 1, dim=1, largest=False).indices[:, 1:]
+        neighbors = points[knn_idx]
+
+        cov = self._compute_covariance(neighbors)
+        eigvals, eigvecs = torch.linalg.eigh(cov)
+        eigvals = torch.clamp(eigvals, min=1e-8)
+        major = torch.sqrt(eigvals[:, 1])
+        minor = torch.sqrt(eigvals[:, 0])
+        prior_scales = torch.stack([major, minor], dim=1)
+
+        major_vec = eigvecs[:, :, 1]
+        angles = torch.atan2(major_vec[:, 1], major_vec[:, 0])
+        angles = (angles / (2 * math.pi)) % 1.0
+        angles = torch.clamp(angles, 0.00001, 0.99999)
+
+        neighbors_subset = self._pad_neighbors(neighbors, self.sample_neighbors)
+        neighbor_idx_subset = self._pad_indices(knn_idx, self.sample_neighbors).long()
+
+        centers_norm = self._normalize_points(points, H, W)
+        neighbors_norm = self._normalize_points(neighbors_subset.reshape(-1, 2), H, W)
+        neighbors_norm = neighbors_norm.view(points.shape[0], self.sample_neighbors, 2)
+
+        prior_scales = prior_scales * 0.5
+
+        return centers_norm, neighbors_norm, prior_scales, angles, neighbor_idx_subset

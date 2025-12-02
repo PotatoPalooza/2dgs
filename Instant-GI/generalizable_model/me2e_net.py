@@ -1,5 +1,6 @@
 import math
 import torch
+import torch.nn.functional as F
 from timm.layers import trunc_normal_
 from torch import nn
 
@@ -158,54 +159,36 @@ class ME2ENet(nn.Module):
         scale_logits = params_flat[..., 2:4]
         scaling = torch.sigmoid(scale_logits) * self.scale_range + self.min_scale
         rotation = torch.sigmoid(params_flat[..., 4:5]) * 2 * torch.pi
-        base_color = torch.sigmoid(params_flat[..., 5:8])
+        # base_color = torch.sigmoid(params_flat[..., 5:8])  # temporarily bypass gaussian color logits
         opacity_base = torch.sigmoid(params_flat[..., 8:9])
         opacity = torch.clamp(opacity_base, min=self.min_opacity, max=1.0)
+
+        base_pixel_grid = grid.unsqueeze(0).expand(B, -1, -1, -1)
+        sampled_color = F.grid_sample(image, base_pixel_grid, align_corners=True)
+        base_color = sampled_color.permute(0, 2, 3, 1).reshape(B, -1, 3)
 
         scaling_pixels = scaling * pixel_scale
         min_scale_px = self.min_scale * pixel_scale.mean()
         reg_terms = self._regularize(scaling_pixels, opacity, base_color, min_scale_px)
 
-        color = base_color * importance_flat
-        opacity = opacity * importance_flat
+        color = base_color #* importance_flat
+        opacity = opacity #* importance_flat
 
         render_imgs = []
-        xy_all = []
-        scaling_all = []
-        rotation_all = []
-        color_all = []
-        opacity_all = []
-
         for b in range(B):
-            xy_b = xy[b]
-            scale_b = scaling[b]
-            rot_b = rotation[b]
-            color_b = color[b]
-            opacity_b = opacity[b]
-
-            xy_all.append(xy_b)
-            scaling_all.append(scale_b)
-            rotation_all.append(rot_b)
-            color_all.append(color_b)
-            opacity_all.append(opacity_b)
-
-            render_img = render(xy_b, scale_b, rot_b, color_b, opacity_b, H, W)["render"]
+            render_img = render(xy[b], scaling[b], rotation[b], color[b], opacity[b], H, W)["render"]
             render_imgs.append(render_img)
 
-        xy_cat = torch.cat(xy_all, dim=0)
-        scaling_cat = torch.cat(scaling_all, dim=0)
-        rotation_cat = torch.cat(rotation_all, dim=0)
-        color_cat = torch.cat(color_all, dim=0)
-        opacity_cat = torch.cat(opacity_all, dim=0)
         render_img = torch.cat(render_imgs, dim=0)
-
         importance_field = importance.squeeze(1)
+
         if get_gaussians:
-            xy_pixels = xy_cat.clone()
-            xy_pixels[..., 0:1] = torch.clamp((xy_cat[..., 0:1] + 1.0) * 0.5 * W, 0.0, W - 1e-4)
-            xy_pixels[..., 1:2] = torch.clamp((xy_cat[..., 1:2] + 1.0) * 0.5 * H, 0.0, H - 1e-4)
-            scaling_pixels_cat = scaling_cat * pixel_scale
-            return xy_pixels, scaling_pixels_cat, rotation_cat, color_cat, opacity_cat, importance_field
+            xy_pixels = xy.clone()
+            # scale to 0-1 xy coords
+            xy_pixels[..., 0:1] = torch.clamp((xy[..., 0:1] + 1.0) * 0.5 * W, 0.0, W - 1e-4)
+            xy_pixels[..., 1:2] = torch.clamp((xy[..., 1:2] + 1.0) * 0.5 * H, 0.0, H - 1e-4)
+            scaling_pixels_cat = scaling * pixel_scale
+            return xy_pixels, scaling_pixels_cat, rotation, color, opacity, importance_field
 
         aux = {
             "gaussian_reg": reg_terms["total"],
