@@ -19,6 +19,7 @@ import torchvision.transforms as transforms
 import wandb
 from torch_kdtree import build_kd_tree
 from generalizable_model.init_net import InitNet
+from generalizable_model.init_net_2 import InitNet2
 from generalizable_model.utils import dither_image
 from quard_image import QuardImage
 import cupy as cp
@@ -33,9 +34,13 @@ def image_path_to_tensor(image_path: Path):
 
 
 @torch.no_grad()
-def init_from_net(image, model):
+def init_from_net(image, model, model_type="net"):
     t_1 = time.time()
-    xy, scale, rotation, color, _opacity, _ = model(image, get_gaussians=True)
+    if model_type == "net":
+        xy, scale, rotation, color, _opacity, _ = model(image, get_gaussians=True)
+    elif model_type == "net2":
+        xy, scale, rotation, color, _opacity = model(image, get_gaussians=True)
+        
     t_2 = time.time()
     print("Init time: ", t_2 - t_1)
     xy = xy.cpu().numpy()
@@ -64,13 +69,13 @@ class SimpleTrainer2d:
         self.num_points = num_points
         self.init_points = None
 
-        if args.model.init_gaussians == "net":
-            self.init_points, self.init_time = init_from_net(self.gt_image, init_net_model)
+        if args.model.init_gaussians == "net" or args.model.init_gaussians == "net2":
+            self.init_points, self.init_time = init_from_net(self.gt_image, init_net_model, args.model.init_gaussians)
             # torch.cuda.empty_cache()
             self.num_points = len(self.init_points)
         elif args.model.init_gaussians == "random":
             if args.model.random_init.same_test:
-                sampled_points, _ = init_from_net(self.gt_image, init_net_model)
+                sampled_points, _ = init_from_net(self.gt_image, init_net_model, args.model.init_gaussians)
                 # torch.cuda.empty_cache()
                 self.num_points = len(sampled_points)
             self.init_time = 0
@@ -315,9 +320,13 @@ def main(argv):
 
     # 2. load init_net
     if args.mode == "train":
-        if args.model.init_gaussians == "net" or (args.model.init_gaussians == "random" and args.model.random_init.same_test):
-            init_net_model = InitNet(kernel_size=args.model.kernel_size).cuda()
-            init_net_model.load_state_dict(torch.load(args.model.init_model_path)["model"])
+        if args.model.init_gaussians == "net" or args.model.init_gaussians == "net2"  or (args.model.init_gaussians == "random" and args.model.random_init.same_test):
+            if args.model.init_gaussians == "net2":
+                init_net_model = InitNet2(kernel_size=args.model.kernel_size).cuda()
+                init_net_model.load_state_dict(torch.load(args.model.init_model_path)["model"])
+            else:
+                init_net_model = InitNet(kernel_size=args.model.kernel_size).cuda()
+                init_net_model.load_state_dict(torch.load(args.model.init_model_path)["model"])
 
     # 2.5 warmup gpu
     warmup_gpu()

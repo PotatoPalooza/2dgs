@@ -333,9 +333,9 @@ class EllipseProcessSoftKNN:
         # 4. Soft-Weighted Attention (The Fix)
         # Weights decay as distance increases.
         # [N, k]
-        local_scale = neighbor_dists.mean(dim=1, keepdim=True) + 1e-6
-        weights = torch.softmax(-neighbor_dists / (local_scale * self.temperature), dim=1)
-        # # weights = torch.ones_like(neighbor_dists) / neighbor_dists.shape[1]
+        #local_scale = neighbor_dists.mean(dim=1, keepdim=True) + 1e-6
+        #weights = torch.softmax(-neighbor_dists / (local_scale * self.temperature), dim=1)
+        weights = torch.ones_like(neighbor_dists) / neighbor_dists.shape[1]
         
         # Gather neighbor coordinates: [N, k, 2]
         # Expand points to gather: [N, N, 2]
@@ -345,14 +345,16 @@ class EllipseProcessSoftKNN:
             1, 
             neighbor_indices.unsqueeze(-1).expand(-1, -1, 2)
         )
+        neighbors = torch.nan_to_num(neighbors, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 5. Weighted Mean and Covariance
         # Mean center of the neighborhood (Soft centroid)
         # sum(w * x) -> [N, 1, 2]
-        soft_mean = (neighbors * weights.unsqueeze(-1)).sum(dim=1, keepdim=True)
+        #soft_mean = (neighbors * weights.unsqueeze(-1)).sum(dim=1, keepdim=True)
         
-        # Centered coordinates
-        centered = neighbors - soft_mean 
+        # Centered coordinates TODO eval which is better
+        #centered = neighbors - soft_mean 
+        centered = neighbors - points.unsqueeze(1)  # [N, k, 2]
         
         # Weighted Covariance: sum(w * (x-u)(x-u)^T)
         # [N, k, 2, 1] * [N, k, 1, 2] -> [N, k, 2, 2]
@@ -363,15 +365,29 @@ class EllipseProcessSoftKNN:
         # 6. Eigendecomposition for Ellipse Parameters
         # Add epsilon to diagonal for stability
         cov = cov + torch.eye(2, device=device).unsqueeze(0) * 1e-6
-        
-        eigvals, eigvecs = torch.linalg.eigh(cov)
+
+        chunk_size = 8192
+        if cov.shape[0] > chunk_size:
+            print(f"[EllipseProcessSoftKNN] chunking eigen solve: total={cov.shape[0]}, chunk={chunk_size}")
+
+        eigvals_list = []
+        eigvecs_list = []
+        for start in range(0, cov.shape[0], chunk_size):
+            end = min(start + chunk_size, cov.shape[0])
+            chunk = cov[start:end]
+            vals, vecs = torch.linalg.eigh(chunk)
+            eigvals_list.append(vals)
+            eigvecs_list.append(vecs)
+
+        eigvals = torch.cat(eigvals_list, dim=0)
+        eigvecs = torch.cat(eigvecs_list, dim=0)
         eigvals = torch.clamp(eigvals, min=1e-8)
         
         # Get major/minor axes
         major = torch.sqrt(eigvals[:, 1])
         minor = torch.sqrt(eigvals[:, 0])
         prior_scales = torch.stack([major, minor], dim=1)
-        prior_scales = prior_scales * 0.5
+        prior_scales = prior_scales * 1.0
 
         # Get Angle
         major_vec = eigvecs[:, :, 1] # Eigenvector corresponding to largest eigenvalue

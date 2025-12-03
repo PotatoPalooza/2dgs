@@ -5,7 +5,7 @@ from torch.nn import functional as F
 
 from gaussianimage_rs import inv_sigmoid
 from generalizable_model.convnext_unet import ConvNeXtUnet
-from generalizable_model.ellipse_process import EllipseProcessKNN
+from generalizable_model.ellipse_process import EllipseProcessSoftKNN
 from gsplat import project_gaussians_2d_scale_rot, rasterize_gaussians_sum
 
 
@@ -62,8 +62,8 @@ def scaling_activation(x):
     )
 
 
-class InitNet(nn.Module):
-    def __init__(self, kernel_size=3, knn_k=6, neighbor_sample=3):
+class InitNet2(nn.Module):
+    def __init__(self, kernel_size=3, knn_k=9, neighbor_sample=3):
         super().__init__()
 
         self.kernel_size = kernel_size
@@ -72,7 +72,7 @@ class InitNet(nn.Module):
         self.sample_points = self.knn_neighbors + 1  # neighbors + center
         self.adjacent_count = min(3, self.knn_neighbors)
 
-        self.ell_process = EllipseProcessKNN(k=knn_k, sample_neighbors=self.knn_neighbors)
+        self.ell_process = EllipseProcessSoftKNN(k=knn_k, sample_neighbors=self.knn_neighbors)
 
         self.feature_net = ConvNeXtUnet(
             out_channels=self.feature_dim, encoder_name='convnext_base',

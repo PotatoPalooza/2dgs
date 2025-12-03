@@ -12,7 +12,7 @@ import os
 import wandb
 from tqdm import tqdm
 from generalizable_model.datasets import get_data_loader
-from generalizable_model.init_net_2 import InitNet
+from generalizable_model.init_net_2 import InitNet2
 from generalizable_model.utils import FocalMSELoss, RGBLoss
 from utils import loss_fn, compute_psnr, Averager, Timer
 from optimizer import Adan
@@ -34,7 +34,7 @@ class Trainer:
         self.vis_valid_indices = sorted(random.sample(range(valid_len), 16))
 
         # load model
-        self.model = InitNet().cuda()
+        self.model = InitNet2().cuda()
         if args.train.pretrained:
             checkpoint = torch.load(args.train.pretrained_checkpoint)
             self.model.load_state_dict(checkpoint["model"])
