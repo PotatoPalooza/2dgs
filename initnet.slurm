@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH -J initnet           # Job name
-#SBATCH -o initnet.out       # Name of stdout output file
-#SBATCH -e initnet.err          # stderr
+#SBATCH -J initnet2           # Job name
+#SBATCH -o initnet2_%j.out       # Name of stdout output file
+#SBATCH -e initnet2_%j.err          # stderr
 #SBATCH -p gpu-a100-small          # Queue (partition) name
 #SBATCH -N 1               # Total # of nodes
 #SBATCH -n 1               # Total # of mpi tas
@@ -15,6 +15,8 @@ conda activate instant-gi
 
 
 cd $WORK/2dgs/Instant-GI
+
+export WANDB_MODE=online
 
 # Run training
 python train_init_net_2.py --config datasets/div2k_train_init_net.yaml
