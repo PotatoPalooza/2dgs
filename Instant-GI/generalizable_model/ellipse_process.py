@@ -311,18 +311,30 @@ class EllipseProcessSoftKNN:
             raise RuntimeError("Need at least two samples to compute KNN priors.")
 
         points = add_boundary_points_torch(points, H, W)
+        N = points.shape[0]
 
-        # 2. Compute Distance Matrix (B, N, N) -> (N, N) since B=1 effectively here for points
-        # If you have batch size > 1, you need to loop or batch-process. 
-        # Assuming single image processing for now based on 'dither_image' usually returning 1 set.
-        dist = torch.cdist(points, points, p=2) # [N, N]
-
-        # 3. Find K Nearest Neighbors
-        # k_eff = K + 1 (including self)
-        k_eff = min(self.k + 1, points.shape[0])
+        k_eff = min(self.k + 1, N)
+        knn_val_list = []
+        knn_idx_list = []
+        knn_chunk_size = 4096
         
-        # knn_val: [N, k_eff], knn_idx: [N, k_eff]
-        knn_val, knn_idx = torch.topk(dist, k_eff, dim=1, largest=False)
+        # We perform the distance calculation in blocks to save VRAM
+        for i in range(0, N, knn_chunk_size):
+            end = min(i + knn_chunk_size, N)
+            query_chunk = points[i:end] # [Batch, 2]
+            
+            # cdist size: [Batch_Chunk, N] -> Much smaller than [N, N]
+            dist_chunk = torch.cdist(query_chunk, points, p=2) 
+            
+            # Immediately reduce to top-k to free memory
+            chunk_val, chunk_idx = torch.topk(dist_chunk, k_eff, dim=1, largest=False)
+            
+            knn_val_list.append(chunk_val)
+            knn_idx_list.append(chunk_idx)
+            
+        # Combine the chunks
+        knn_val = torch.cat(knn_val_list, dim=0) # [N, k_eff]
+        knn_idx = torch.cat(knn_idx_list, dim=0) # [N, k_eff]
         
         # Exclude self (first column) for the neighbor list
         # But for covariance, we often include self or just use neighbors. 
@@ -339,12 +351,7 @@ class EllipseProcessSoftKNN:
         
         # Gather neighbor coordinates: [N, k, 2]
         # Expand points to gather: [N, N, 2]
-        all_points_expanded = points.unsqueeze(0).expand(points.shape[0], -1, -1)
-        neighbors = torch.gather(
-            all_points_expanded, 
-            1, 
-            neighbor_indices.unsqueeze(-1).expand(-1, -1, 2)
-        )
+        neighbors = points[neighbor_indices]
         neighbors = torch.nan_to_num(neighbors, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 5. Weighted Mean and Covariance
@@ -367,8 +374,8 @@ class EllipseProcessSoftKNN:
         cov = cov + torch.eye(2, device=device).unsqueeze(0) * 1e-6
 
         chunk_size = 8192
-        if cov.shape[0] > chunk_size:
-            print(f"[EllipseProcessSoftKNN] chunking eigen solve: total={cov.shape[0]}, chunk={chunk_size}")
+        #if cov.shape[0] > chunk_size:
+        #    print(f"[EllipseProcessSoftKNN] chunking eigen solve: total={cov.shape[0]}, chunk={chunk_size}")
 
         eigvals_list = []
         eigvecs_list = []
