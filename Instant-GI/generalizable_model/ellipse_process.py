@@ -313,10 +313,17 @@ class EllipseProcessSoftKNN:
         points = add_boundary_points_torch(points, H, W)
         N = points.shape[0]
 
+        MAX_N = 80000 
+        if N > MAX_N:
+             perm = torch.randperm(N, device=device)[:MAX_N]
+             points = points[perm]
+             N = MAX_N
+
         k_eff = min(self.k + 1, N)
         knn_val_list = []
         knn_idx_list = []
-        knn_chunk_size = 4096
+        #knn_chunk_size = 4096
+        knn_chunk_size = 2048
         
         # We perform the distance calculation in blocks to save VRAM
         for i in range(0, N, knn_chunk_size):
@@ -350,7 +357,6 @@ class EllipseProcessSoftKNN:
         weights = torch.ones_like(neighbor_dists) / neighbor_dists.shape[1]
         
         # Gather neighbor coordinates: [N, k, 2]
-        # Expand points to gather: [N, N, 2]
         neighbors = points[neighbor_indices]
         neighbors = torch.nan_to_num(neighbors, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -373,7 +379,7 @@ class EllipseProcessSoftKNN:
         # Add epsilon to diagonal for stability
         cov = cov + torch.eye(2, device=device).unsqueeze(0) * 1e-6
 
-        chunk_size = 8192
+        chunk_size = 4096
         #if cov.shape[0] > chunk_size:
         #    print(f"[EllipseProcessSoftKNN] chunking eigen solve: total={cov.shape[0]}, chunk={chunk_size}")
 

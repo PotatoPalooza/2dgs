@@ -1,0 +1,31 @@
+mode: train #[train, test]
+
+dataset:
+  dataset_name: div2k
+  images_dir: ./data/div2k/div2k_valid/X2
+  start: 844 # 844 879 858
+  images_num: 1
+  regex: '{:04d}_x2.png'
+  image_paths: [] # Only activate when the dataset_name is set as "general"
+
+model:
+  model_name: GaussianImage_RS # now only support GaussianImage_RS
+  init_gaussians: "net2" # [net, random, quard]
+  kernel_size: 3
+  init_model_path: ./checkpoints/train_init_rose-shadow-40/epoch_best.pth
+  random_init:
+    same_test: true # If same test is true, it will use the init net to initalize the number of gaussians, otherwise using the below "num_points".
+    num_points: 20000 # number of gaussians when random initialization
+
+train:
+  iterations: 20000
+  lr: 0.001
+  save_path: ./output
+  seed: 42
+  limit_train: True
+  limit_train_log_point: [2, 10, 20] # run only x seconds, and record psnr
+
+wandb: # use wandb to record the training process
+  activate: True
+  record_iter: 2000
+  project_name: "Instant-GI"
