@@ -37,16 +37,35 @@ def min_bounding_ellipse(vertices):
     return center, axes, angle
 
 
-def add_boundary_points_torch(points, H, W):
+def add_boundary_points_torch(points, H, W,sample_size=2048):
     device = points.device
     dtype = points.dtype
-    if points.shape[0] < 2:
+    N = points.shape[0]
+    if N < 2:
         mean_dist = torch.tensor(float(min(H, W)) / 2.0, device=device, dtype=dtype)
     else:
-        dist = torch.cdist(points, points, p=2)
-        dist.fill_diagonal_(float("inf"))
-        nearest_dist = dist.min(dim=1).values
-        mean_dist = nearest_dist.mean()
+        if N > sample_size:
+            # Randomly select 'sample_size' indices
+            idx = torch.randperm(N, device=device)[:sample_size]
+            query_points = points[idx]
+            
+            # Compute distance only from the sample subset to ALL points
+            # Shape: [sample_size, N]
+            dist = torch.cdist(query_points, points, p=2)
+            
+            # We get the top 2 smallest values. 
+            # The 1st smallest is the point itself (dist=0.0). 
+            # The 2nd smallest is the actual nearest neighbor.
+            # values shape: [sample_size, 2]
+            nearest_dist = dist.topk(k=2, dim=1, largest=False).values[:, 1]
+            mean_dist = nearest_dist.mean()
+        else:
+            # Fallback to exact computation for small point clouds
+            dist = torch.cdist(points, points, p=2)
+            dist.fill_diagonal_(float("inf"))
+            nearest_dist = dist.min(dim=1).values
+            mean_dist = nearest_dist.mean()
+
     add_point_interval = torch.clamp(3 * mean_dist, min=1.0)
     interval = add_point_interval.item()
     x_interval_num = max(2, int(math.ceil(W / interval)))
