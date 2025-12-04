@@ -3,6 +3,7 @@
 Script to download ImageNet-1k dataset from HuggingFace and save locally.
 Usage:
     python scripts/download_imagenet.py --save_dir ./data/imagenet --split validation
+    python scripts/download_imagenet.py --save_dir ./data/imagenet --split validation --image_size 224
 """
 
 import argparse
@@ -47,11 +48,20 @@ def main():
         action="store_true",
         help="Don't resume - re-download existing images"
     )
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        default=None,
+        help="Optional target image size (square). If provided, images will be resized to (image_size, image_size) before saving. "
+             "Uses center crop to maintain aspect ratio. Example: --image_size 224"
+    )
     
     args = parser.parse_args()
     
     print(f"Downloading ImageNet-1k {args.split} set...")
     print(f"Save directory: {args.save_dir}")
+    if args.image_size:
+        print(f"Image size: {args.image_size}x{args.image_size}")
     print("Note: This requires HuggingFace login. Run 'huggingface-cli login' first.")
     print()
     
@@ -61,7 +71,8 @@ def main():
             split=args.split,
             hf_token=args.hf_token,
             max_images=args.max_images,
-            resume=not args.no_resume
+            resume=not args.no_resume,
+            image_size=args.image_size
         )
         if args.max_images:
             print(f"\n✓ Successfully downloaded {args.max_images} images from ImageNet-1k {args.split} set to {args.save_dir}")

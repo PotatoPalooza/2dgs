@@ -2,23 +2,31 @@
 """
 Compress ImageNet images using Instant-GI (2D Gaussian Splatting) and rasterize them back to images.
 
-This script:
-1. Loads images from an input directory
-2. Compresses them into Gaussians using Instant-GI model
-3. Rasterizes the Gaussians back into images
-4. Saves the rendered images to an output directory
+This script can operate in two modes:
+1. Compress mode: Loads images, compresses them using Instant-GI model, and rasterizes them
+2. Rasterize mode: Loads pre-generated splats (.pt files) and rasterizes them to images
 
-Usage:
+Usage (Compress mode):
     python scripts/compress_imagenet_instantgi.py \
         --input_dir ./data/imagenet/validation \
         --output_dir ./output/compressed_imagenet \
         --checkpoint ./Instant-GI/checkpoints/epoch_best_ks_3_cupy.pth
+
+Usage (Rasterize mode):
+    python scripts/compress_imagenet_instantgi.py \
+        --input_dir ./output/imagenet_gaussians \
+        --output_dir ./output/compressed_imagenet \
+        --mode rasterize \
+        --image_size 224 224 \
+        --max_splats 10000 \
+        --limit_method importance
 """
 
 import argparse
 import sys
 from pathlib import Path
 import os
+from typing import Optional
 import torch
 from PIL import Image
 import torchvision.transforms as transforms
@@ -32,6 +40,74 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(REPO_ROOT / "Instant-GI"))
 
 from generalizable_model.init_net import InitNet, render
+
+
+def limit_splats(gaussians: dict, max_splats: int, method: str = "importance"):
+    """
+    Limit the number of splats in the gaussians dictionary.
+    
+    Args:
+        gaussians: Dictionary with keys 'xy', 'scaling', 'rotation', 'color', 'triangles'
+        max_splats: Maximum number of splats to keep
+        method: Method to select splats - 'random', 'opacity' (by scaling), or 'importance'
+    
+    Returns:
+        Filtered gaussians dictionary
+    """
+    num_splats = gaussians['xy'].shape[0]
+    if num_splats <= max_splats:
+        return gaussians
+    
+    if method == "random":
+        indices = torch.randperm(num_splats, device=gaussians['xy'].device)[:max_splats]
+    elif method == "opacity":
+        # Sort by average scaling (larger = more important)
+        avg_scaling = gaussians['scaling'].mean(dim=1)
+        _, indices = torch.topk(avg_scaling, max_splats)
+    elif method == "importance":
+        # Combine scaling and color intensity as importance metric
+        avg_scaling = gaussians['scaling'].mean(dim=1)
+        color_intensity = gaussians['color'].mean(dim=1)
+        importance = avg_scaling * color_intensity
+        _, indices = torch.topk(importance, max_splats)
+    else:
+        raise ValueError(f"Unknown method: {method}. Must be 'random', 'opacity', or 'importance'")
+    
+    # Filter all tensors
+    result = {
+        'xy': gaussians['xy'][indices],
+        'scaling': gaussians['scaling'][indices],
+        'rotation': gaussians['rotation'][indices],
+        'color': gaussians['color'][indices],
+        'triangles': gaussians['triangles'][indices] if gaussians['triangles'] is not None else None,
+    }
+    return result
+
+
+def load_splats_from_file(splat_path: Path, device: torch.device) -> dict:
+    """
+    Load Gaussian splats from a .pt file.
+    
+    Args:
+        splat_path: Path to the .pt file containing splats
+        device: Device to load tensors on
+    
+    Returns:
+        Dictionary containing Gaussian parameters: xy, scaling, rotation, color, triangles
+    """
+    if not splat_path.exists():
+        raise FileNotFoundError(f"Splat file not found: {splat_path}")
+    
+    gaussians = torch.load(splat_path, map_location=device)
+    
+    # Ensure all tensors are on the correct device
+    return {
+        "xy": gaussians["xy"].to(device),
+        "scaling": gaussians["scaling"].to(device),
+        "rotation": gaussians["rotation"].to(device),
+        "color": gaussians["color"].to(device),
+        "triangles": gaussians.get("triangles", None),
+    }
 
 
 def setup_model(checkpoint_path: str, device: torch.device):
@@ -160,26 +236,59 @@ def tensor_to_pil(image_tensor: torch.Tensor) -> Image.Image:
 
 def process_image(
     image_path: Path,
-    model: InitNet,
+    model: Optional[InitNet],
     output_path: Path,
-    device: torch.device
+    device: torch.device,
+    mode: str = "compress",
+    image_size: Optional[tuple] = None,
+    max_splats: Optional[int] = None,
+    limit_method: str = "importance"
 ):
     """
-    Process a single image: load, compress, rasterize, and save.
+    Process a single image: load, compress (if needed), rasterize, and save.
     
     Args:
-        image_path: Path to input image
-        model: Instant-GI model
+        image_path: Path to input image (or .pt file in rasterize mode)
+        model: Instant-GI model (can be None in rasterize mode)
         output_path: Path to save rendered image
         device: Device to perform computation on
+        mode: 'compress' or 'rasterize'
+        image_size: (H, W) tuple for rasterize mode. If None, will try to infer from original image
+        max_splats: Optional maximum number of splats to use (rasterize mode only)
+        limit_method: Method to use when limiting splats ('random', 'opacity', or 'importance')
+    
+    Returns:
+        True if successful, False otherwise
     """
     try:
-        # Load image
-        image_tensor = load_image(image_path, device)
-        _, _, H, W = image_tensor.shape
-        
-        # Compress to Gaussians
-        gaussians = compress_to_gaussians(model, image_tensor)
+        if mode == "compress":
+            # Load image
+            image_tensor = load_image(image_path, device)
+            _, _, H, W = image_tensor.shape
+            
+            # Compress to Gaussians
+            gaussians = compress_to_gaussians(model, image_tensor)
+            
+        elif mode == "rasterize":
+            # Load splats from .pt file
+            gaussians = load_splats_from_file(image_path, device)
+            
+            # Limit splats if requested
+            if max_splats is not None:
+                gaussians = limit_splats(gaussians, max_splats, method=limit_method)
+            
+            # Determine image size
+            if image_size is not None:
+                H, W = image_size
+            else:
+                # Try to infer from the original image path
+                # Assuming .pt files correspond to images with same name
+                # This is a fallback - image_size should be provided
+                # For now, use a default or try to load original image
+                raise ValueError("image_size must be provided in rasterize mode")
+            
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
         
         # Rasterize back to image
         rendered_image = rasterize_gaussians(
@@ -205,57 +314,85 @@ def process_image(
 def process_directory(
     input_dir: Path,
     output_dir: Path,
-    model: InitNet,
+    model: Optional[InitNet],
     device: torch.device,
-    image_extensions: set = {'.jpg', '.jpeg', '.png', '.JPEG', '.PNG'}
+    mode: str = "compress",
+    image_extensions: Optional[set] = None,
+    image_size: Optional[tuple] = None,
+    max_splats: Optional[int] = None,
+    limit_method: str = "importance"
 ):
     """
-    Process all images in a directory recursively.
+    Process all images/splats in a directory recursively.
     
     Args:
-        input_dir: Input directory containing images
+        input_dir: Input directory containing images or .pt files
         output_dir: Output directory to save rendered images
-        model: Instant-GI model
+        model: Instant-GI model (can be None in rasterize mode)
         device: Device to perform computation on
-        image_extensions: Set of image file extensions to process
+        mode: 'compress' or 'rasterize'
+        image_extensions: Set of image file extensions to process (for compress mode)
+        image_size: (H, W) tuple for rasterize mode
+        max_splats: Optional maximum number of splats per image (rasterize mode only)
+        limit_method: Method to use when limiting splats ('random', 'opacity', or 'importance')
     """
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     
-    # Find all image files recursively
-    image_files = []
-    for ext in image_extensions:
-        image_files.extend(input_dir.rglob(f'*{ext}'))
+    # Find all files recursively
+    if mode == "compress":
+        # Find image files
+        if image_extensions is None:
+            image_extensions = {'.jpg', '.jpeg', '.png', '.JPEG', '.PNG'}
+        files = []
+        for ext in image_extensions:
+            files.extend(input_dir.rglob(f'*{ext}'))
+        file_type = "images"
+    elif mode == "rasterize":
+        # Find .pt files
+        files = list(input_dir.rglob('*.pt'))
+        file_type = "splat files"
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
     
-    if len(image_files) == 0:
-        print(f"No images found in {input_dir}")
+    if len(files) == 0:
+        print(f"No {file_type} found in {input_dir}")
         return
     
-    print(f"Found {len(image_files)} images to process")
+    print(f"Found {len(files)} {file_type} to process")
     
-    # Process each image
+    # Process each file
     success_count = 0
-    for image_path in tqdm(image_files, desc="Processing images"):
+    for file_path in tqdm(files, desc=f"Processing {file_type}"):
         # Maintain directory structure in output
-        relative_path = image_path.relative_to(input_dir)
-        output_path = output_dir / relative_path
+        relative_path = file_path.relative_to(input_dir)
         
-        if process_image(image_path, model, output_path, device):
+        # Change extension to .png for output
+        if mode == "rasterize":
+            # .pt -> .png
+            output_path = output_dir / relative_path.with_suffix('.png')
+        else:
+            # Keep original extension or convert to .png
+            output_path = output_dir / relative_path.with_suffix('.png')
+        
+        if process_image(file_path, model, output_path, device, mode=mode, image_size=image_size, 
+                        max_splats=max_splats, limit_method=limit_method):
             success_count += 1
     
-    print(f"\nProcessed {success_count}/{len(image_files)} images successfully")
+    print(f"\nProcessed {success_count}/{len(files)} {file_type} successfully")
     print(f"Output saved to {output_dir}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compress ImageNet images using Instant-GI and rasterize them back"
+        description="Compress ImageNet images using Instant-GI and rasterize them back, "
+                    "or rasterize pre-generated splats"
     )
     parser.add_argument(
         "--input_dir",
         type=str,
         required=True,
-        help="Input directory containing ImageNet images (can be nested)"
+        help="Input directory containing images (compress mode) or .pt files (rasterize mode)"
     )
     parser.add_argument(
         "--output_dir",
@@ -264,10 +401,17 @@ def main():
         help="Output directory to save rasterized images"
     )
     parser.add_argument(
+        "--mode",
+        type=str,
+        default="compress",
+        choices=["compress", "rasterize"],
+        help="Mode: 'compress' (use Instant-GI model) or 'rasterize' (load from .pt files). Default: compress"
+    )
+    parser.add_argument(
         "--checkpoint",
         type=str,
         default=None,
-        help="Path to Instant-GI checkpoint file. "
+        help="Path to Instant-GI checkpoint file (required for compress mode). "
              f"Defaults to {REPO_ROOT}/Instant-GI/checkpoints/epoch_best_ks_3_cupy.pth"
     )
     parser.add_argument(
@@ -275,6 +419,37 @@ def main():
         type=str,
         default=None,
         help="Device to use (cuda/cpu). Defaults to cuda if available"
+    )
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("H", "W"),
+        help="Image size (height width) for rasterize mode. Required when mode=rasterize"
+    )
+    parser.add_argument(
+        "--extensions",
+        type=str,
+        default=".jpg,.jpeg,.png,.JPEG,.PNG",
+        help="Comma-separated list of image extensions to process (compress mode only). "
+             "Default: .jpg,.jpeg,.png,.JPEG,.PNG"
+    )
+    parser.add_argument(
+        "--max_splats",
+        type=int,
+        default=None,
+        help="Maximum number of splats per image to use (rasterize mode only). "
+             "If not specified, all splats are used."
+    )
+    parser.add_argument(
+        "--limit_method",
+        type=str,
+        default="importance",
+        choices=["random", "opacity", "importance"],
+        help="Method to use when limiting splats (rasterize mode only): "
+             "'random' (random selection), 'opacity' (by scaling/opacity), "
+             "or 'importance' (by scaling * color intensity). Default: 'importance'"
     )
     
     args = parser.parse_args()
@@ -286,26 +461,41 @@ def main():
         device = torch.device(args.device)
     
     print(f"Using device: {device}")
+    print(f"Mode: {args.mode}")
     
-    # Set default checkpoint path if not provided
-    if args.checkpoint is None:
-        checkpoint_path = REPO_ROOT / "Instant-GI/checkpoints/epoch_best_ks_3_cupy.pth"
-    else:
-        checkpoint_path = Path(args.checkpoint)
+    # Load model only if in compress mode
+    model = None
+    if args.mode == "compress":
+        # Set default checkpoint path if not provided
+        if args.checkpoint is None:
+            checkpoint_path = REPO_ROOT / "Instant-GI/checkpoints/epoch_best_ks_3_cupy.pth"
+        else:
+            checkpoint_path = Path(args.checkpoint)
+        
+        print(f"Checkpoint path: {checkpoint_path}")
+        print()
+        
+        # Load model
+        try:
+            model = setup_model(checkpoint_path, device)
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            sys.exit(1)
+        print()
+    elif args.mode == "rasterize":
+        if args.image_size is None:
+            print("Error: --image_size is required when mode=rasterize")
+            print("Example: --image_size 224 224")
+            sys.exit(1)
+        print(f"Image size: {args.image_size[0]}x{args.image_size[1]}")
+        if args.max_splats is not None:
+            print(f"Max splats per image: {args.max_splats}")
+            print(f"Limit method: {args.limit_method}")
+        else:
+            print(f"Max splats per image: No limit (using all splats)")
+        print()
     
-    print(f"Checkpoint path: {checkpoint_path}")
-    print()
-    
-    # Load model
-    try:
-        model = setup_model(checkpoint_path, device)
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        sys.exit(1)
-    
-    print()
-    
-    # Process images
+    # Process files
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
     
@@ -315,9 +505,26 @@ def main():
     
     print(f"Input directory: {input_dir}")
     print(f"Output directory: {output_dir}")
+    
+    # Parse extensions for compress mode
+    if args.mode == "compress":
+        exts = set(ext.strip() for ext in args.extensions.split(','))
+    else:
+        exts = None
+    
     print()
     
-    process_directory(input_dir, output_dir, model, device)
+    # Convert image_size to tuple if provided
+    image_size = tuple(args.image_size) if args.image_size else None
+    
+    process_directory(
+        input_dir, output_dir, model, device,
+        mode=args.mode,
+        image_extensions=exts,
+        image_size=image_size,
+        max_splats=args.max_splats,
+        limit_method=args.limit_method
+    )
     
     print("\n✓ Processing completed!")
 
