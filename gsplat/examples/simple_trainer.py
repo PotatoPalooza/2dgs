@@ -16,6 +16,7 @@ import tyro
 import viser
 import yaml
 from datasets.colmap import Dataset, Parser
+from gaussian_image_dataset import GaussianImageDataset
 from datasets.traj import (
     generate_ellipse_path_z,
     generate_interpolated_path,
@@ -55,6 +56,12 @@ class Config:
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
     data_factor: int = 4
+    # Optional path to 2D Gaussian scenes exported by Instant-GI
+    gaussian_data_dir: Optional[str] = None
+    # Initialization method used when generating the gaussians ("net" or "random")
+    gaussian_init_method: Literal["net", "random"] = "net"
+    # Whether to apply Instant-GI activations (tanh/scale/rotation) on load
+    gaussian_apply_activation: bool = True
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -208,6 +215,24 @@ class Config:
             assert_never(strategy)
 
 
+def infer_gaussian_dir_from_data(data_dir: str, data_factor: int) -> Optional[Path]:
+    """
+    Heuristic to map a COLMAP data directory to the matching Instant-GI export.
+
+    Example:
+        data_dir = data/360_v2/garden, data_factor = 4
+        -> data/360_v2_gs/garden_d4
+    """
+    base = Path(data_dir)
+    dataset_root = base.parent  # e.g., data/360_v2
+    parent = dataset_root.parent
+    if parent == dataset_root:
+        return None
+
+    gaussian_root = parent / f"{dataset_root.name}_gs" / f"{base.name}_d{data_factor}"
+    return gaussian_root if gaussian_root.exists() else None
+
+
 def create_splats_with_optimizers(
     parser: Parser,
     init_type: str = "sfm",
@@ -338,6 +363,55 @@ class Runner:
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
         )
+
+        # Optional 2D Gaussian scene (Instant-GI export)
+        self.gaussian_dataset = None
+        gaussian_root: Optional[Path] = None
+        if cfg.gaussian_data_dir is not None:
+            gaussian_root = Path(cfg.gaussian_data_dir)
+        else:
+            gaussian_root = infer_gaussian_dir_from_data(
+                cfg.data_dir, cfg.data_factor
+            )
+
+        if gaussian_root is not None and gaussian_root.exists():
+            self.gaussian_dataset = GaussianImageDataset(
+                gaussian_root,
+                init_method=cfg.gaussian_init_method,
+                apply_activation=cfg.gaussian_apply_activation,
+            )
+            # Map each image to its gaussian frame by filename stem.
+            self.image_to_gaussians = {}
+            missing = []
+            for path in self.parser.image_paths:
+                stem = Path(path).stem
+                frame = self.gaussian_dataset.get_frame(stem)
+                if frame is None:
+                    missing.append(stem)
+                else:
+                    self.image_to_gaussians[stem] = frame
+            print(
+                f"Loaded 2D Gaussian scene from {gaussian_root}: "
+                f"{len(self.gaussian_dataset)} frames, "
+                f"total splats={self.gaussian_dataset.total_gaussians}"
+            )
+            if missing:
+                print(
+                    f"Warning: {len(missing)} images missing gaussians "
+                    f"(examples: {missing[:3]})"
+                )
+            else:
+                print(
+                    f"Gaussian mapping complete: matched all "
+                    f"{len(self.parser.image_paths)} images."
+                )
+        else:
+            self.image_to_gaussians = {}
+            if cfg.gaussian_data_dir is not None:
+                print(f"Gaussian directory not found: {gaussian_root}")
+            else:
+                print("No gaussian directory inferred; skipping 2D gaussian loading.")
+
         self.trainset = Dataset(
             self.parser,
             split="train",
