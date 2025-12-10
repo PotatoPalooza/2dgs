@@ -37,7 +37,7 @@ def image_path_to_tensor(image_path: Path):
 def init_from_net(image, model, model_type="net"):
     t_1 = time.time()
     if model_type == "net":
-        xy, scale, rotation, color, _opacity, _ = model(image, get_gaussians=True)
+        xy, scale, rotation, color, _triangles = model(image, get_gaussians=True)
     elif model_type == "net2":
         xy, scale, rotation, color, _opacity = model(image, get_gaussians=True)
         
@@ -324,7 +324,7 @@ def main(argv):
             if args.model.init_gaussians == "net2":
                 init_net_model = InitNet2(kernel_size=args.model.kernel_size).cuda()
                 init_net_model.load_state_dict(torch.load(args.model.init_model_path)["model"])
-            else:
+            elif args.model.init_gaussians == "net":
                 init_net_model = InitNet(kernel_size=args.model.kernel_size).cuda()
                 init_net_model.load_state_dict(torch.load(args.model.init_model_path)["model"])
 

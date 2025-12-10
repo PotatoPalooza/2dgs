@@ -11,6 +11,62 @@ import time
 import math
 
 
+def knn_search(points, k, chunk_size=1024):
+    """
+    points: [N, 2] float tensor
+    k:      number of neighbors to return
+    chunk_size: number of queries processed per chunk to save VRAM
+
+    Returns:
+        knn_val: [N, k]  distances
+        knn_idx: [N, k]  indices into points
+    """
+
+    # Number of points
+    N = points.shape[0]
+    # k_eff: allow k or k+1 logic externally if needed
+    k_eff = min(k, N)
+
+    knn_val_list = []
+    knn_idx_list = []
+
+    # Loop over chunks of queries
+    for i in range(0, N, chunk_size):
+        end = min(i + chunk_size, N)
+        query_chunk = points[i:end]           # [chunk, 2]
+
+        # -------------------------------------------------
+        # Heavy part: disable grad to avoid huge activations
+        # -------------------------------------------------
+    
+        # Compute pairwise distances for the chunk
+        # (use half for memory, cast result back to float)
+        dist_chunk = torch.cdist(
+            query_chunk,
+            points,
+            p=2
+        )                        # [chunk, N]
+
+        # Top-k nearest points
+        chunk_val, chunk_idx = torch.topk(
+            dist_chunk,
+            k_eff,
+            dim=1,
+            largest=False
+        )
+
+        # Store results
+        knn_val_list.append(chunk_val)
+        knn_idx_list.append(chunk_idx)
+
+    # Concatenate all chunks
+    knn_val = torch.cat(knn_val_list, dim=0)   # [N, k_eff]
+    knn_idx = torch.cat(knn_idx_list, dim=0)   # [N, k_eff]
+
+    return knn_val, knn_idx
+
+
+
 # pool = None
 # def init_pool(cpu_num):
 #     global pool
@@ -320,29 +376,8 @@ class EllipseProcessSoftKNN:
              N = MAX_N
 
         k_eff = min(self.k + 1, N)
-        knn_val_list = []
-        knn_idx_list = []
-        #knn_chunk_size = 4096
-        knn_chunk_size = 2048
-        
-        # We perform the distance calculation in blocks to save VRAM
-        for i in range(0, N, knn_chunk_size):
-            end = min(i + knn_chunk_size, N)
-            query_chunk = points[i:end] # [Batch, 2]
-            
-            # cdist size: [Batch_Chunk, N] -> Much smaller than [N, N]
-            dist_chunk = torch.cdist(query_chunk, points, p=2) 
-            
-            # Immediately reduce to top-k to free memory
-            chunk_val, chunk_idx = torch.topk(dist_chunk, k_eff, dim=1, largest=False)
-            
-            knn_val_list.append(chunk_val)
-            knn_idx_list.append(chunk_idx)
-            
-        # Combine the chunks
-        knn_val = torch.cat(knn_val_list, dim=0) # [N, k_eff]
-        knn_idx = torch.cat(knn_idx_list, dim=0) # [N, k_eff]
-        
+        knn_val, knn_idx = knn_search(points, k_eff,2048)
+        #knn_val, knn_idx = get_knn_keops(points, k_eff)
         # Exclude self (first column) for the neighbor list
         # But for covariance, we often include self or just use neighbors. 
         # Let's use neighbors only for shape context.

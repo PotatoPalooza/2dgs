@@ -12,9 +12,9 @@ matplotlib
 opencv-python
 einops
 wandb
-git+https://github.com/thomgrand/torch_kdtree.git
+#git+https://github.com/thomgrand/torch_kdtree.git
 timm
 # self define modules
-./submodules/gsplat
-./submodules/ellipse_fit
-./submodules/torch_dither
+#./submodules/gsplat
+#./submodules/ellipse_fit
+#./submodules/torch_dither
