@@ -1,0 +1,9 @@
+notebooks
+output
+*.JPEG
+*.csv
+*.txt
+*.npy
+results*
+plots*
+.vscode

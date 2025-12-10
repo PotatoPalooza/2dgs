@@ -106,7 +106,8 @@ def download_imagenet(
     split: str = "validation",
     hf_token: Optional[str] = None,
     max_images: Optional[int] = None,
-    resume: bool = True
+    resume: bool = True,
+    image_size: Optional[int] = None
 ):
     """
     Download ImageNet-1k dataset from HuggingFace and save to local directory.
@@ -118,6 +119,8 @@ def download_imagenet(
         hf_token: HuggingFace token (if not provided, will use cached login)
         max_images: Maximum number of images to download (None for full dataset)
         resume: If True, skip images that already exist (useful for resuming)
+        image_size: Optional target image size (square). If provided, images will be resized to (image_size, image_size) before saving.
+                    Uses center crop to maintain aspect ratio if needed.
     
     Returns:
         Path to the downloaded dataset directory
@@ -137,6 +140,9 @@ def download_imagenet(
         print("This may take a while. The dataset is ~150GB for the full set.")
     else:
         print(f"Downloading {max_images} images from ImageNet-1k {split} set to {save_path}...")
+    
+    if image_size is not None:
+        print(f"Images will be resized to {image_size}x{image_size} pixels")
     
     try:
         # Use streaming mode for partial downloads to avoid downloading everything first
@@ -180,6 +186,32 @@ def download_imagenet(
                 if resume and image_path.exists():
                     skipped_count += 1
                     continue
+                
+                # Resize image if image_size is specified
+                if image_size is not None:
+                    # Resize maintaining aspect ratio, then center crop to exact size
+                    # This matches the standard ImageNet preprocessing
+                    width, height = image.size
+                    
+                    # Calculate the scaling factor to make the smaller dimension equal to image_size
+                    # Then we'll center crop to get exact square
+                    if width < height:
+                        new_width = image_size
+                        new_height = int(height * (image_size / width))
+                    else:
+                        new_height = image_size
+                        new_width = int(width * (image_size / height))
+                    
+                    # Resize maintaining aspect ratio
+                    image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                    
+                    # Center crop to exact size
+                    width, height = image.size
+                    left = (width - image_size) // 2
+                    top = (height - image_size) // 2
+                    right = left + image_size
+                    bottom = top + image_size
+                    image = image.crop((left, top, right, bottom))
                 
                 image.save(image_path)
                 saved_count += 1
@@ -247,4 +279,3 @@ def get_imagenet_data_loader(
         prefetch_factor=4,
         pin_memory=True
     )
-
