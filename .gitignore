@@ -1,10 +1,13 @@
-notebooks
 output
+data
 *.JPEG
 *.csv
 *.txt
 *.npy
 results*
 plots*
-.vscode
+*.vscode
+*.pt
+*.png
+*.jpg
 *.pyc
