@@ -188,7 +188,9 @@ class Config:
     # Weight for chamfer loss
     chamfer_lambda: float = 0.0
     # Number of points per chunk when computing chamfer distance
-    chamfer_chunk_size: int = 8192
+    chamfer_chunk_size: int = 16384
+    # Maximum number of points sampled per set when evaluating chamfer (None = all)
+    chamfer_max_points: Optional[int] = None
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -453,6 +455,7 @@ class Runner:
                 gaussian_dataset=self.gaussian_dataset,
                 image_paths=self.train_image_paths,
                 chunk_size=cfg.chamfer_chunk_size,
+                max_points=cfg.chamfer_max_points,
             ).to(self.torch_device)
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
@@ -829,6 +832,9 @@ class Runner:
                     width=width,
                     height=height,
                     packed=self.cfg.packed,
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    gaussian_means=self.splats["means"],
                 )
                 loss += chamferloss * cfg.chamfer_lambda
             if cfg.use_bilateral_grid:
