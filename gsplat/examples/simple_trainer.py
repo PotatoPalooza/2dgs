@@ -16,6 +16,7 @@ import tyro
 import viser
 import yaml
 from datasets.colmap import Dataset, Parser
+from gaussian_image_dataset import GaussianImageDataset
 from datasets.traj import (
     generate_ellipse_path_z,
     generate_interpolated_path,
@@ -38,6 +39,7 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
+from gs_init import lift_gaussians_to_3d
 
 
 @dataclass
@@ -55,6 +57,12 @@ class Config:
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
     data_factor: int = 4
+    # Optional path to 2D Gaussian scenes exported by Instant-GI
+    gaussian_data_dir: Optional[str] = None
+    # Initialization method used when generating the gaussians ("net" or "random")
+    gaussian_init_method: Literal["net", "random"] = "net"
+    # Whether to apply Instant-GI activations (tanh/scale/rotation) on load
+    gaussian_apply_activation: bool = True
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -75,6 +83,8 @@ class Config:
     batch_size: int = 1
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
+    # Optional cap on total gaussians when using gs-init (None = no cap)
+    max_init_splats: Optional[int] = None
 
     # Number of training steps
     max_steps: int = 30_000
@@ -208,6 +218,24 @@ class Config:
             assert_never(strategy)
 
 
+def infer_gaussian_dir_from_data(data_dir: str, data_factor: int) -> Optional[Path]:
+    """
+    Heuristic to map a COLMAP data directory to the matching Instant-GI export.
+
+    Example:
+        data_dir = data/360_v2/garden, data_factor = 4
+        -> data/360_v2_gs/garden_d4
+    """
+    base = Path(data_dir)
+    dataset_root = base.parent  # e.g., data/360_v2
+    parent = dataset_root.parent
+    if parent == dataset_root:
+        return None
+
+    gaussian_root = parent / f"{dataset_root.name}_gs" / f"{base.name}_d{data_factor}"
+    return gaussian_root if gaussian_root.exists() else None
+
+
 def create_splats_with_optimizers(
     parser: Parser,
     init_type: str = "sfm",
@@ -230,6 +258,9 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    gaussian_dataset=None,
+    image_to_gaussians=None,
+    max_init_splats: Optional[int] = None,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -237,8 +268,19 @@ def create_splats_with_optimizers(
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
+    elif init_type == "gs-init":
+        if gaussian_dataset is None or image_to_gaussians is None:
+            raise ValueError("gs-init requires gaussian_dataset and image_to_gaussians.")
+        points, rgbs = lift_gaussians_to_3d(
+            parser,
+            gaussian_dataset,
+            image_to_gaussians,
+            device=torch.device(device),
+            mode="ray",
+            max_samples=max_init_splats,
+        )
     else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
+        raise ValueError("Please specify a correct init_type: sfm, random, or gs-init")
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -338,6 +380,55 @@ class Runner:
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
         )
+
+        # Optional 2D Gaussian scene (Instant-GI export)
+        self.gaussian_dataset = None
+        gaussian_root: Optional[Path] = None
+        if cfg.gaussian_data_dir is not None:
+            gaussian_root = Path(cfg.gaussian_data_dir)
+        else:
+            gaussian_root = infer_gaussian_dir_from_data(
+                cfg.data_dir, cfg.data_factor
+            )
+
+        if gaussian_root is not None and gaussian_root.exists():
+            self.gaussian_dataset = GaussianImageDataset(
+                gaussian_root,
+                init_method=cfg.gaussian_init_method,
+                apply_activation=cfg.gaussian_apply_activation,
+            )
+            # Map each image to its gaussian frame by filename stem.
+            self.image_to_gaussians = {}
+            missing = []
+            for path in self.parser.image_paths:
+                stem = Path(path).stem
+                frame = self.gaussian_dataset.get_frame(stem)
+                if frame is None:
+                    missing.append(stem)
+                else:
+                    self.image_to_gaussians[stem] = frame
+            print(
+                f"Loaded 2D Gaussian scene from {gaussian_root}: "
+                f"{len(self.gaussian_dataset)} frames, "
+                f"total splats={self.gaussian_dataset.total_gaussians}"
+            )
+            if missing:
+                print(
+                    f"Warning: {len(missing)} images missing gaussians "
+                    f"(examples: {missing[:3]})"
+                )
+            else:
+                print(
+                    f"Gaussian mapping complete: matched all "
+                    f"{len(self.parser.image_paths)} images."
+                )
+        else:
+            self.image_to_gaussians = {}
+            if cfg.gaussian_data_dir is not None:
+                print(f"Gaussian directory not found: {gaussian_root}")
+            else:
+                print("No gaussian directory inferred; skipping 2D gaussian loading.")
+
         self.trainset = Dataset(
             self.parser,
             split="train",
@@ -372,6 +463,9 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            gaussian_dataset=self.gaussian_dataset,
+            image_to_gaussians=getattr(self, "image_to_gaussians", None),
+            max_init_splats=cfg.max_init_splats,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
