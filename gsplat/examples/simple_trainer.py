@@ -39,6 +39,7 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
+from gs_init import lift_gaussians_to_3d
 
 
 @dataclass
@@ -82,6 +83,8 @@ class Config:
     batch_size: int = 1
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
+    # Optional cap on total gaussians when using gs-init (None = no cap)
+    max_init_splats: Optional[int] = None
 
     # Number of training steps
     max_steps: int = 30_000
@@ -255,6 +258,9 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    gaussian_dataset=None,
+    image_to_gaussians=None,
+    max_init_splats: Optional[int] = None,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -262,8 +268,19 @@ def create_splats_with_optimizers(
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
+    elif init_type == "gs-init":
+        if gaussian_dataset is None or image_to_gaussians is None:
+            raise ValueError("gs-init requires gaussian_dataset and image_to_gaussians.")
+        points, rgbs = lift_gaussians_to_3d(
+            parser,
+            gaussian_dataset,
+            image_to_gaussians,
+            device=torch.device(device),
+            mode="ray",
+            max_samples=max_init_splats,
+        )
     else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
+        raise ValueError("Please specify a correct init_type: sfm, random, or gs-init")
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -446,6 +463,9 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            gaussian_dataset=self.gaussian_dataset,
+            image_to_gaussians=getattr(self, "image_to_gaussians", None),
+            max_init_splats=cfg.max_init_splats,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
