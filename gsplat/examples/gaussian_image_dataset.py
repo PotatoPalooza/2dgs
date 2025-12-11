@@ -67,6 +67,16 @@ def _apply_instant_gi_activation(
     return xy, scale, rotation, opacity, color
 
 
+def _load_gaussian_checkpoint(model_path: Path) -> Dict[str, torch.Tensor]:
+    """Load checkpoint safely with weights_only when available."""
+    load_kwargs = {"map_location": "cpu"}
+    try:
+        return torch.load(model_path, weights_only=True, **load_kwargs)
+    except TypeError:
+        # Older torch versions do not support weights_only.
+        return torch.load(model_path, **load_kwargs)
+
+
 def load_gaussian_model(
     model_path: Union[str, Path],
     init_method: InitMethod = "net",
@@ -89,7 +99,7 @@ def load_gaussian_model(
         (stacked [x, y, sx, sy, rot, opacity, r, g, b]).
     """
     model_path = Path(model_path)
-    checkpoint = torch.load(model_path, map_location="cpu")
+    checkpoint = _load_gaussian_checkpoint(model_path)
 
     xy = checkpoint["_xyz"]
     scale = checkpoint["_scaling"]
@@ -175,7 +185,7 @@ class GaussianImageDataset(Dataset):
         pattern = f"**/{self.init_method}/gaussian_model.pth.tar"
         for model_path in sorted(self.scene_root.glob(pattern)):
             name = model_path.parent.parent.name  # frame directory name
-            checkpoint = torch.load(model_path, map_location="cpu")
+            checkpoint = _load_gaussian_checkpoint(model_path)
             num_gaussians = checkpoint["_xyz"].shape[0]
             frame = GaussianFrame(
                 name=name,

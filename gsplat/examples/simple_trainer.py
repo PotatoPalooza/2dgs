@@ -111,6 +111,8 @@ class Config:
     sh_degree_interval: int = 1000
     # Initial opacity of GS
     init_opa: float = 0.1
+    # Initial opacity override when using gs-init (lower to avoid oversaturation)
+    gs_init_opa: float = 0.02
     # Initial scale of GS
     init_scale: float = 1.0
     # Weight for SSIM loss
@@ -441,12 +443,13 @@ class Runner:
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
+        init_opa = cfg.gs_init_opa if cfg.init_type == "gs-init" else cfg.init_opa
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
             init_num_pts=cfg.init_num_pts,
             init_extent=cfg.init_extent,
-            init_opacity=cfg.init_opa,
+            init_opacity=init_opa,
             init_scale=cfg.init_scale,
             means_lr=cfg.means_lr,
             scales_lr=cfg.scales_lr,
