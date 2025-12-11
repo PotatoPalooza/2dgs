@@ -23,7 +23,7 @@ from datasets.traj import (
     generate_spiral_path,
 )
 from fused_ssim import fused_ssim
-from chamfer_loss import ChamferLoss
+from chamfer_loss import ProjectedChamferLoss
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -363,6 +363,7 @@ class Runner:
         self.local_rank = local_rank
         self.world_size = world_size
         self.device = f"cuda:{local_rank}"
+        self.torch_device = torch.device(self.device)
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -446,18 +447,13 @@ class Runner:
         self.train_image_paths = [self.parser.image_paths[i] for i in self.trainset.indices]
         if cfg.chamfer_loss and self.gaussian_dataset is None:
             print("Chamfer loss is enabled but no 2D gaussian data was found; skipping chamfer term.")
-        self.chamfer_loss_computer = (
-            ChamferLoss(
+        self.chamfer_loss_fn: Optional[ProjectedChamferLoss] = None
+        if cfg.chamfer_loss:
+            self.chamfer_loss_fn = ProjectedChamferLoss(
                 gaussian_dataset=self.gaussian_dataset,
-                image_to_gaussians=self.image_to_gaussians,
-                train_image_paths=self.train_image_paths,
-                device=torch.device(self.device),
-                packed=self.cfg.packed,
-                chunk_size=self.cfg.chamfer_chunk_size,
-            )
-            if cfg.chamfer_loss
-            else None
-        )
+                image_paths=self.train_image_paths,
+                chunk_size=cfg.chamfer_chunk_size,
+            ).to(self.torch_device)
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -822,9 +818,17 @@ class Runner:
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
-            if cfg.chamfer_loss and cfg.chamfer_lambda > 0.0 and self.chamfer_loss_computer is not None:
-                chamferloss = self.chamfer_loss_computer(
-                    info=info, image_ids=image_ids, width=width, height=height
+            if (
+                cfg.chamfer_loss
+                and cfg.chamfer_lambda > 0.0
+                and self.chamfer_loss_fn is not None
+            ):
+                chamferloss = self.chamfer_loss_fn(
+                    render_info=info,
+                    view_indices=image_ids,
+                    width=width,
+                    height=height,
+                    packed=self.cfg.packed,
                 )
                 loss += chamferloss * cfg.chamfer_lambda
             if cfg.use_bilateral_grid:
