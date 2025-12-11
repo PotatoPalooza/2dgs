@@ -43,6 +43,7 @@ class ProjectedChamferLoss(nn.Module):
     def _get_pred_points(
         self, 
         info: Dict, 
+        batch_idx: int,
         cam_idx: int, 
         screen_size: torch.Tensor, 
         packed: bool
@@ -55,16 +56,21 @@ class ProjectedChamferLoss(nn.Module):
         # Extract points based on packing strategy
         if packed:
             cam_ids = info.get("camera_ids")
-            batch_ids = info.get("batch_ids", torch.zeros_like(cam_ids))
-            mask = (cam_ids == cam_idx) & (batch_ids == 0)
+            if cam_ids is None:
+                return None
+            batch_ids = info.get("batch_ids")
+            if batch_ids is None:
+                batch_ids = torch.zeros_like(cam_ids)
+            mask = (cam_ids == cam_idx) & (batch_ids == batch_idx)
             points = means2d[mask]
         else:
             # Unpacked: [Batch, Cam, Points, 2]
             radii = info.get("radii")
             if radii is None: return None
-            
-            valid_mask = (radii[0, cam_idx] > 0).all(dim=-1)
-            points = means2d[0, cam_idx][valid_mask]
+            if batch_idx >= means2d.shape[0]:
+                return None
+            valid_mask = (radii[batch_idx, cam_idx] > 0).all(dim=-1)
+            points = means2d[batch_idx, cam_idx][valid_mask]
 
         if points.numel() == 0:
             return None
@@ -95,8 +101,8 @@ class ProjectedChamferLoss(nn.Module):
             if gt_xy is None or gt_xy.numel() == 0:
                 continue
 
-            # 2. Get Prediction (Source)
-            pred_xy = self._get_pred_points(render_info, batch_i, screen_size, packed)
+            # 2. Get Prediction (Source). For our dataloader each sample has a single view (cam_idx=0).
+            pred_xy = self._get_pred_points(render_info, batch_i, 0, screen_size, packed)
             if pred_xy is None:
                 continue
 
