@@ -23,6 +23,7 @@ from datasets.traj import (
     generate_spiral_path,
 )
 from fused_ssim import fused_ssim
+from chamfer_loss import ChamferLoss
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -182,6 +183,12 @@ class Config:
     depth_loss: bool = False
     # Weight for depth loss
     depth_lambda: float = 1e-2
+    # Enable chamfer loss against 2D gaussian projections
+    chamfer_loss: bool = False
+    # Weight for chamfer loss
+    chamfer_lambda: float = 0.0
+    # Number of points per chunk when computing chamfer distance
+    chamfer_chunk_size: int = 8192
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -436,6 +443,21 @@ class Runner:
             load_depths=cfg.depth_loss,
         )
         self.valset = Dataset(self.parser, split="val")
+        self.train_image_paths = [self.parser.image_paths[i] for i in self.trainset.indices]
+        if cfg.chamfer_loss and self.gaussian_dataset is None:
+            print("Chamfer loss is enabled but no 2D gaussian data was found; skipping chamfer term.")
+        self.chamfer_loss_computer = (
+            ChamferLoss(
+                gaussian_dataset=self.gaussian_dataset,
+                image_to_gaussians=self.image_to_gaussians,
+                train_image_paths=self.train_image_paths,
+                device=torch.device(self.device),
+                packed=self.cfg.packed,
+                chunk_size=self.cfg.chamfer_chunk_size,
+            )
+            if cfg.chamfer_loss
+            else None
+        )
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -780,6 +802,7 @@ class Runner:
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            chamferloss = None
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -799,6 +822,11 @@ class Runner:
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
+            if cfg.chamfer_loss and cfg.chamfer_lambda > 0.0 and self.chamfer_loss_computer is not None:
+                chamferloss = self.chamfer_loss_computer(
+                    info=info, image_ids=image_ids, width=width, height=height
+                )
+                loss += chamferloss * cfg.chamfer_lambda
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
@@ -811,9 +839,12 @@ class Runner:
 
             loss.backward()
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            desc = f"loss={loss.item():.3f}| sh degree={sh_degree_to_use}| "
+            desc += f"rgb={l1loss.item():.3f}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
+            if cfg.chamfer_loss and chamferloss is not None:
+                desc += f"chmfr={chamferloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -834,6 +865,8 @@ class Runner:
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+                if chamferloss is not None:
+                    self.writer.add_scalar("train/chamferloss", chamferloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
