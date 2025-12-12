@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Dict, Optional, List, Literal
 from pathlib import Path
 
@@ -49,6 +50,47 @@ def _chunked_min_dist(
         mins.append(dists.min(dim=1).values)
 
     return torch.cat(mins)
+
+
+def _project_points(
+    points: torch.Tensor,
+    viewmat: torch.Tensor,
+    K: torch.Tensor,
+    width: int,
+    height: int,
+) -> Optional[torch.Tensor]:
+    """Project 3D points into image space with gradients."""
+    if points.numel() == 0:
+        return None
+    ones = torch.ones_like(points[:, :1])
+    homo = torch.cat([points, ones], dim=1)  # [N,4]
+    cam = homo @ viewmat.T  # [N,4]
+    cam = cam[:, :3]
+    depth = cam[:, 2:3]
+    pos = depth.squeeze(-1) > 1e-6
+    if not pos.any():
+        return None
+    cam = cam[pos]
+    pixels = cam @ K.T
+    xy = pixels[:, :2] / pixels[:, 2:3].clamp_min(1e-6)
+    scale = torch.tensor([width - 1.0, height - 1.0], device=xy.device, dtype=xy.dtype)
+    return xy / scale * 2.0 - 1.0
+
+
+def _conic_to_scale_rot(conics: torch.Tensor) -> Optional[tuple]:
+    if conics is None or conics.numel() == 0:
+        return None
+    a, b, c = conics[:, 0], conics[:, 1], conics[:, 2]
+    trace = a + c
+    det = a * c - b * b
+    discriminant = torch.clamp(trace * trace - 4 * det, min=0.0)
+    sqrt_disc = torch.sqrt(discriminant)
+    lambda1 = (trace + sqrt_disc) / 2
+    lambda2 = (trace - sqrt_disc) / 2
+    scale_x = torch.clamp(1.0 / torch.sqrt(torch.clamp(lambda1, min=1e-6)), max=10.0)
+    scale_y = torch.clamp(1.0 / torch.sqrt(torch.clamp(lambda2, min=1e-6)), max=10.0)
+    rotation = torch.atan2(b, lambda1 - a).unsqueeze(-1) % (2 * 3.14159265)
+    return torch.stack([scale_x, scale_y], dim=-1), rotation
 
 # --- NEW: Subsampling utility ---
 
@@ -202,152 +244,112 @@ class ProjectedChamferLoss(nn.Module):
         return self._cache[stem]
 
     def _normalize_attributes(
-        self, 
+        self,
         xy: torch.Tensor,
         scale: Optional[torch.Tensor] = None,
         rotation: Optional[torch.Tensor] = None,
         opacity: Optional[torch.Tensor] = None,
-        color: Optional[torch.Tensor] = None
+        color: Optional[torch.Tensor] = None,
+        attr_mode: Optional[str] = None,
     ) -> torch.Tensor:
         """Normalize and concatenate attributes into a feature vector [N, D_f]."""
+        mode = attr_mode if attr_mode is not None else self.attribute_mode
         features = [xy]
-        
-        if self.attribute_mode == "xy_only":
+
+        if mode == "xy_only":
             return torch.cat(features, dim=-1)
-        
-        # Add geometric attributes
-        if self.attribute_mode in ["geometric", "all"]:
+
+        if mode in ["geometric", "all"]:
             if scale is not None:
                 if self._scale_norm is None:
-                    self._scale_norm = 10.0 
+                    self._scale_norm = 10.0
                 scale_norm = (scale / self._scale_norm) * self.weights["scale"]
                 features.append(scale_norm)
-                
+
             if rotation is not None:
                 if self._rotation_norm is None:
                     self._rotation_norm = 2 * 3.14159265
                 rotation_norm = (rotation / self._rotation_norm) * self.weights["rotation"]
                 features.append(rotation_norm)
-        
-        # Add appearance attributes
-        if self.attribute_mode == "all":
+
+        if mode == "all":
             if opacity is not None:
                 opacity_norm = opacity * self.weights["opacity"]
                 features.append(opacity_norm)
-                
+
             if color is not None:
                 color_norm = color * self.weights["color"]
                 features.append(color_norm)
-        
+
         return torch.cat(features, dim=-1)
 
     def _get_pred_gaussians(
-        self, 
-        info: Dict, 
+        self,
+        info: Dict,
         batch_idx: int,
-        screen_size: torch.Tensor, 
-        packed: bool
+        screen_size: torch.Tensor,
+        packed: bool,
+        gaussian_means: torch.Tensor,
+        gaussian_scales: torch.Tensor,
+        gaussian_opacities: torch.Tensor,
+        gaussian_colors: Optional[torch.Tensor],
+        viewmats: torch.Tensor,
+        Ks: torch.Tensor,
+        width: int,
+        height: int,
     ) -> Optional[Dict[str, torch.Tensor]]:
         """
-        Extracts predicted 2D Gaussian attributes from render info.
-        Corrected indexing for unpacked tensors with shape [B, N, D] or [B, C, N, D]
-        where B=1 and C=1.
+        Project predicted 3D Gaussians to 2D with gradients. Supports packed and unpacked.
         """
-        means2d = info.get("means2d")
-        if means2d is None:
-            return None
-        
         if packed:
-            # Packed mode uses a 1D mask over a flat tensor [Total_Points, D]
-            cam_ids = info.get("camera_ids")
-            if cam_ids is None: return None
-            batch_ids = info.get("batch_ids", torch.zeros_like(cam_ids))
-            
-            mask = (cam_ids == batch_idx) & (batch_ids == 0) 
-            
-            xy = means2d[mask]
-            
-            conics_flat = info.get("conics")
-            conics = conics_flat[mask] if conics_flat is not None else None
-            
-            opacities_2d_flat = info.get("opacities")
-            opacities_2d = opacities_2d_flat[mask] if opacities_2d_flat is not None else None
-            
+            gaussian_ids = info.get("gaussian_ids")
+            batch_ids = info.get("batch_ids")
+            camera_ids = info.get("camera_ids")
+            if (
+                gaussian_ids is None
+                or batch_ids is None
+                or camera_ids is None
+                or gaussian_ids.numel() == 0
+            ):
+                return None
+            mask = (batch_ids == batch_idx) & (camera_ids == 0)
+            if not mask.any():
+                return None
+            ids = gaussian_ids[mask].long()
         else:
-            # Unpacked mode with shape [1, 138k, D]
-            try:
-                means2d_slice = means2d[batch_idx] 
-            except IndexError:
-                means2d_slice = means2d[batch_idx, 0]
-
             radii = info.get("radii")
-            if radii is None: return None
+            if radii is None:
+                return None
+            if radii.dim() == 3:
+                # [C, N, 2]
+                if batch_idx >= radii.shape[0]:
+                    return None
+                view_radii = radii[batch_idx]
+            else:
+                # [B, C, N, 2]
+                if batch_idx >= radii.shape[0]:
+                    return None
+                view_radii = radii[batch_idx, 0]
+            valid_mask = (view_radii > 0).all(dim=-1)
+            if not valid_mask.any():
+                return None
+            ids = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1).long()
 
-            try:
-                radii_slice = radii[batch_idx]
-            except IndexError:
-                radii_slice = radii[batch_idx, 0]
-                
-            # MASK FIX: Must use .all(dim=-1) to collapse [N, 2] mask to [N]
-            valid_mask = (radii_slice > 0).all(dim=-1)
-            
-            xy = means2d_slice[valid_mask]
-            
-            # Apply mask to other attributes
-            conics = info.get("conics")
-            if conics is not None:
-                try:
-                    conics_slice = conics[batch_idx]
-                except IndexError:
-                    conics_slice = conics[batch_idx, 0]
-
-                conics = conics_slice[valid_mask]
-                
-            opacities_2d = info.get("opacities")
-            if opacities_2d is not None:
-                try:
-                    opacities_2d_slice = opacities_2d[batch_idx]
-                except IndexError:
-                    opacities_2d_slice = opacities_2d[batch_idx, 0]
-                    
-                opacities_2d = opacities_2d_slice[valid_mask]
-
-        if xy.numel() == 0:
+        points3d = gaussian_means[ids]
+        viewmat = viewmats[min(batch_idx, viewmats.shape[0] - 1)]
+        K = Ks[min(batch_idx, Ks.shape[0] - 1)]
+        xy = _project_points(points3d, viewmat, K, width, height)
+        if xy is None or xy.numel() == 0:
             return None
-
-        # Normalize xy to NDC [-1, 1]
         xy_norm = xy / (screen_size - 1.0) * 2.0 - 1.0
-        
+
         result = {"xy": xy_norm}
-        
-        if conics is not None and self.attribute_mode in ["geometric", "all"]:
-            # Decompose conic to get scale-like features
-            a, b, c = conics[:, 0], conics[:, 1], conics[:, 2]
-            
-            # Compute eigenvalues
-            trace = a + c
-            det = a * c - b * b
-            discriminant = torch.clamp(trace * trace - 4 * det, min=0.0)
-            sqrt_disc = torch.sqrt(discriminant)
-            
-            lambda1 = (trace + sqrt_disc) / 2
-            lambda2 = (trace - sqrt_disc) / 2
-            
-            scale_x = torch.clamp(1.0 / torch.sqrt(torch.clamp(lambda1, min=1e-6)), max=10.0)
-            scale_y = torch.clamp(1.0 / torch.sqrt(torch.clamp(lambda2, min=1e-6)), max=10.0)
-            
-            result["scale"] = torch.stack([scale_x, scale_y], dim=-1)
-            
-            # Compute rotation
-            vec_x = b
-            vec_y = lambda1 - a
-            rotation = torch.atan2(vec_y, vec_x).unsqueeze(-1) 
-            rotation = rotation % (2 * 3.14159265)
-            result["rotation"] = rotation
-        
-        if opacities_2d is not None and self.attribute_mode == "all":
-            result["opacity"] = opacities_2d.unsqueeze(-1) 
-        
+        # Use differentiable parameters directly
+        result["scale"] = torch.exp(gaussian_scales[ids])[:, :2]  # [N,2]
+        result["opacity"] = torch.sigmoid(gaussian_opacities[ids]).unsqueeze(-1)  # [N,1]
+        if gaussian_colors is not None:
+            result["color"] = gaussian_colors[ids]  # [N,3]
+
         return result
 
     def forward(
@@ -356,14 +358,38 @@ class ProjectedChamferLoss(nn.Module):
         view_indices: torch.Tensor, 
         width: int, 
         height: int, 
-        packed: bool = False
+        packed: bool = False,
+        camtoworlds: Optional[torch.Tensor] = None,
+        Ks: Optional[torch.Tensor] = None,
+        gaussian_means: Optional[torch.Tensor] = None,
+        gaussian_scales: Optional[torch.Tensor] = None,
+        gaussian_opacities: Optional[torch.Tensor] = None,
+        gaussian_colors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         
         if self.dataset is None:
             return torch.tensor(0.0, device=view_indices.device)
+        if (
+            camtoworlds is None
+            or Ks is None
+            or gaussian_means is None
+            or gaussian_scales is None
+            or gaussian_opacities is None
+            or gaussian_colors is None
+        ):
+            raise ValueError(
+                "Chamfer loss needs camtoworlds, Ks, gaussian_means, scales, opacities, colors."
+            )
 
         device = view_indices.device
         screen_size = torch.tensor([width, height], device=device, dtype=torch.float32)
+        camtoworlds = camtoworlds.to(device)
+        Ks = Ks.to(device)
+        gaussian_means = gaussian_means.to(device)
+        gaussian_scales = gaussian_scales.to(device)
+        gaussian_opacities = gaussian_opacities.to(device)
+        gaussian_colors = gaussian_colors.to(device)
+        viewmats = torch.linalg.inv(camtoworlds)
         losses = []
 
         for batch_i, view_idx in enumerate(view_indices.tolist()):
@@ -373,44 +399,62 @@ class ProjectedChamferLoss(nn.Module):
                 continue
 
             # 2. Get Prediction (Source) - Expected shape: [N, D_f]
-            pred_data = self._get_pred_gaussians(render_info, batch_i, screen_size, packed)
+            pred_data = self._get_pred_gaussians(
+                render_info,
+                batch_i,
+                screen_size,
+                packed,
+                gaussian_means,
+                gaussian_scales,
+                gaussian_opacities,
+                gaussian_colors,
+                viewmats,
+                Ks,
+                width,
+                height,
+            )
             if pred_data is None:
                 continue
             
-            # 3. Normalize and create feature vectors
-            gt_features = self._normalize_attributes(
-                xy=gt_data["xy"],
-                scale=gt_data.get("scale"),
-                rotation=gt_data.get("rotation"),
-                opacity=gt_data.get("opacity"),
-                color=gt_data.get("color")
-            ).to(device)
-            
-            pred_features = self._normalize_attributes(
-                xy=pred_data["xy"],
-                scale=pred_data.get("scale"),
-                rotation=pred_data.get("rotation"),
-                opacity=pred_data.get("opacity"),
-                color=None 
-            )
+            # Subsample xy consistently
+            gt_xy = self._subsample_features(gt_data["xy"].to(device))
+            pred_xy = self._subsample_features(pred_data["xy"])
 
-            if gt_features.numel() == 0 or pred_features.numel() == 0:
-                print(f"Empty Chamfer: GT size {gt_features.numel()}, Pred size {pred_features.numel()}")
+            if gt_xy.numel() == 0 or pred_xy.numel() == 0:
                 continue
-            
-            # NEW: Subsample both GT and Pred features
-            gt_features_sub = self._subsample_features(gt_features)
-            pred_features_sub = self._subsample_features(pred_features)
-                
-            print(f"Chamfer Loss Input Shapes (after subsampling): "
-                  f"GT {gt_features.shape} -> {gt_features_sub.shape}, "
-                  f"Pred {pred_features.shape} -> {pred_features_sub.shape}")
 
-            # 4. Compute Chamfer Distance on subsampled points
-            loss = symmetric_chamfer_distance(
-                gt_features_sub, pred_features_sub, self.chunk_size
+            chamfer_xy = symmetric_chamfer_distance(
+                gt_xy, pred_xy, self.chunk_size
             )
-            losses.append(loss)
+
+            # NN matching from xy to regress other attrs
+            attr_loss = torch.tensor(0.0, device=device)
+            dists = torch.cdist(pred_xy, gt_xy)  # [Np, Ng]
+            nn_idx = dists.argmin(dim=1)  # [Np]
+
+            if "opacity" in pred_data and "opacity" in gt_data:
+                gt_op = self._subsample_features(gt_data["opacity"].to(device))
+                pred_op = self._subsample_features(pred_data["opacity"])
+                if gt_op.shape[0] == gt_xy.shape[0] and pred_op.shape[0] == pred_xy.shape[0]:
+                    matched = gt_op[nn_idx]
+                    attr_loss = attr_loss + torch.nn.functional.l1_loss(pred_op, matched)
+
+            if "scale" in pred_data and "scale" in gt_data:
+                gt_scale = self._subsample_features(gt_data["scale"].to(device))
+                pred_scale = self._subsample_features(pred_data["scale"])
+                if gt_scale.shape[0] == gt_xy.shape[0] and pred_scale.shape[0] == pred_xy.shape[0]:
+                    matched = gt_scale[nn_idx]
+                    attr_loss = attr_loss + torch.nn.functional.l1_loss(pred_scale, matched)
+
+            if "color" in pred_data and "color" in gt_data:
+                gt_color = self._subsample_features(gt_data["color"].to(device))
+                pred_color = self._subsample_features(pred_data["color"])
+                if gt_color.shape[0] == gt_xy.shape[0] and pred_color.shape[0] == pred_xy.shape[0]:
+                    matched = gt_color[nn_idx]
+                    attr_loss = attr_loss + torch.nn.functional.l1_loss(pred_color, matched)
+
+            total = chamfer_xy + attr_loss
+            losses.append(total)
 
         if not losses:
             return torch.tensor(0.0, device=device)

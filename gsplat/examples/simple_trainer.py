@@ -23,7 +23,7 @@ from datasets.traj import (
     generate_spiral_path,
 )
 from fused_ssim import fused_ssim
-from chamfer_loss import ProjectedChamferLoss
+from chamfer_loss_fix import ProjectedChamferLoss
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -37,10 +37,23 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
-from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy import DefaultStrategy, FastStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 from gs_init import lift_gaussians_to_3d
+
+# Tyro helper so FastStrategy registers as its own subcommand instead of
+# collapsing into DefaultStrategy (its superclass).
+try:
+    StrategyConfig = tyro.extras.subcommand_type_from_defaults(
+        {
+            "fast": FastStrategy(verbose=True),
+            "default": DefaultStrategy(verbose=True),
+            "mcmc": MCMCStrategy(verbose=True),
+        }
+    )
+except AttributeError:
+    StrategyConfig = Union[FastStrategy, DefaultStrategy, MCMCStrategy]
 
 
 @dataclass
@@ -97,6 +110,8 @@ class Config:
     save_ply: bool = False
     # Steps to save the model as ply
     ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    # Optional early evaluation/checkpoint iteration (None to disable)
+    initial_eval_iter: Optional[int] = 100
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
 
@@ -122,10 +137,8 @@ class Config:
     # Far plane clipping distance
     far_plane: float = 1e10
 
-    # Strategy for GS densification
-    strategy: Union[DefaultStrategy, MCMCStrategy] = field(
-        default_factory=DefaultStrategy
-    )
+    # Strategy for GS densification.
+    strategy: StrategyConfig = field(default_factory=DefaultStrategy)
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
     packed: bool = False
     # Use sparse gradients for optimization. (experimental)
@@ -784,6 +797,18 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
+            # FastStrategy (Fast-GS-style) multi-view masks/scores.
+            # Compute per-pixel L1 error map and a high-error mask for VCD/VCP.
+            # Note: photo_loss uses per-view L1 mean as a proxy (SSIM is computed later).
+            with torch.no_grad():
+                l1_map = (colors - pixels).abs().mean(dim=-1)  # [B, H, W]
+                l1_min = l1_map.amin(dim=(-2, -1), keepdim=True)
+                l1_max = l1_map.amax(dim=(-2, -1), keepdim=True)
+                l1_norm = (l1_map - l1_min) / (l1_max - l1_min + 1e-8)
+                tau = getattr(cfg.strategy, "high_err_tau", 0.2)
+                info["high_err_mask"] = l1_norm > float(tau)
+                info["photo_loss"] = l1_map.mean(dim=(-2, -1))
+
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -829,6 +854,12 @@ class Runner:
                     width=width,
                     height=height,
                     packed=self.cfg.packed,
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    gaussian_means=self.splats["means"],
+                    gaussian_scales=self.splats["scales"],
+                    gaussian_opacities=self.splats["opacities"],
+                    gaussian_colors=torch.sigmoid(self.splats["sh0"][:, 0, :]),
                 )
                 loss += chamferloss * cfg.chamfer_lambda
             if cfg.use_bilateral_grid:
@@ -1340,6 +1371,12 @@ if __name__ == "__main__":
             "Gaussian splatting training using densification heuristics from the original paper.",
             Config(
                 strategy=DefaultStrategy(verbose=True),
+            ),
+        ),
+        "fast": (
+            "FAST-GS-inspired densification with multi-view Chamfer consistency scoring.",
+            Config(
+                strategy=FastStrategy(verbose=True),
             ),
         ),
         "mcmc": (
