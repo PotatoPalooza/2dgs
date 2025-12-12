@@ -44,6 +44,7 @@ from gs_init import (
     lift_gaussians_to_3d,
     lift_gaussians_to_3d_with_dense_depth,
     lift_random_points_with_dense_depth,
+    lift_prob_points_with_dense_depth,
 )
 from depth_loader import DepthLoader
 
@@ -319,6 +320,9 @@ def create_splats_with_optimizers(
     dense_depth_max_abs: Optional[float] = None,
     max_init_splats: Optional[int] = None,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
+    init_scales_log: Optional[torch.Tensor] = None
+    init_opacities_logit: Optional[torch.Tensor] = None
+
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
@@ -341,7 +345,7 @@ def create_splats_with_optimizers(
             raise ValueError(
                 "gs-depth requires gaussian_dataset, image_to_gaussians, and depth_loader."
             )
-        points, rgbs = lift_gaussians_to_3d_with_dense_depth(
+        points, rgbs, init_scales_log, init_opacities_logit = lift_gaussians_to_3d_with_dense_depth(
             parser,
             gaussian_dataset,
             image_to_gaussians,
@@ -365,15 +369,34 @@ def create_splats_with_optimizers(
             max_depth_scale=dense_depth_max_scale,
             max_depth_abs=dense_depth_max_abs,
         )
+    elif init_type == "gs-prob":
+        if gaussian_dataset is None or depth_loader is None:
+            raise ValueError("gs-prob requires gaussian_dataset and depth_loader.")
+        target_n = max_init_splats if max_init_splats is not None else init_num_pts
+        points, rgbs = lift_prob_points_with_dense_depth(
+            parser,
+            gaussian_dataset=gaussian_dataset,
+            depth_loader=depth_loader,
+            num_points=int(target_n),
+            device=torch.device(device),
+            depth_percentile=dense_depth_percentile,
+            max_depth_scale=dense_depth_max_scale,
+            max_depth_abs=dense_depth_max_abs,
+        )
     else:
         raise ValueError(
-            "Please specify a correct init_type: sfm, random, gs-init, gs-depth, or rand-depth"
+            "Please specify a correct init_type: sfm, random, gs-init, gs-depth, rand-depth, or gs-prob"
         )
 
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+    # Initialize the GS size.
+    if init_scales_log is None:
+        # Default: average dist of the 3 nearest neighbors.
+        dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+        dist_avg = torch.sqrt(dist2_avg)
+        scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+    else:
+        # Use per-point scales derived from 2D gaussian footprint + depth.
+        scales = init_scales_log + math.log(max(init_scale, 1e-8))
 
     # Distribute the GSs to different ranks (also works for single rank)
     points = points[world_rank::world_size]
@@ -382,7 +405,15 @@ def create_splats_with_optimizers(
 
     N = points.shape[0]
     quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+    if init_opacities_logit is None:
+        opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+    else:
+        # Map per-point 2D opacity (via logit) into the 3DGS logit parameterization,
+        # using init_opacity as a global baseline.
+        # This avoids saturating to near-opaque when the 2D opacity is 1.0 (Instant-GI default).
+        o = torch.sigmoid(init_opacities_logit)[world_rank::world_size] * init_opacity
+        o = torch.clamp(o, 1e-4, 1.0 - 1e-4)
+        opacities = torch.logit(o)
 
     params = [
         # name, value, lr

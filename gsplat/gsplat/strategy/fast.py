@@ -34,13 +34,18 @@ class FastStrategy(DefaultStrategy):
             high-error overlap (default 9).
     """
 
-    # Defaults aligned with the Fast-GS paper. Note that VCD/VCP are approximated
-    # via sampled footprints in gsplat; adjust as needed per scene.
-    high_err_tau: float = 0.2
-    vcd_thresh: float = 5.0
-    vcd_min_views: int = 2
-    vcp_thresh: float = 0.9
-    vcp_pre_fraction: float = 0.5
+    # Defaults: tuned to be less aggressive than the paper defaults.
+    # The Fast-GS paper settings (tau=0.2, vcd_thresh=5, vcd_min_views=2, etc.)
+    # can under-densify early (VCD gate too strict) while still pruning via
+    # baseline opacity/size pruning. These defaults aim to:
+    # - allow growth earlier (lower VCD thresholds),
+    # - reduce pre-stop pruning pressure (lower vcp_pre_fraction),
+    # while keeping the overall spirit of multi-view pruning.
+    high_err_tau: float = 0.1
+    vcd_thresh: float = 2.0
+    vcd_min_views: int = 1
+    vcp_thresh: float = 0.97
+    vcp_pre_fraction: float = 0.2
     # Paper-style accumulation across views (no EMA). If you enable EMA by setting
     # mv_decay < 1, min-views gating uses a separate raw counter.
     mv_decay: float = 1.0
@@ -108,7 +113,9 @@ class FastStrategy(DefaultStrategy):
 
         if packed:
             gs_ids = info["gaussian_ids"]
-            view_ids = info.get("image_ids", None)
+            # Packed mode uses explicit camera indices for each projected gaussian.
+            # `image_ids` is not guaranteed to be present in gsplat's packed info dict.
+            view_ids = info.get("camera_ids", None)
             coords_vis = coords
             radii_vis = radii2d.max(dim=-1).values
         else:

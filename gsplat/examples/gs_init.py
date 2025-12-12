@@ -536,3 +536,178 @@ def lift_random_points_with_dense_depth(
         colors_t = colors_t[idx_sel]
 
     return points_t, colors_t
+
+
+def lift_prob_points_with_dense_depth(
+    parser: Parser,
+    gaussian_dataset: GaussianImageDataset,
+    depth_loader: DepthLoader,
+    num_points: int,
+    device: torch.device = torch.device("cpu"),
+    chunk_size: int = 8192,
+    min_depth: float = 1e-3,
+    depth_percentile: float = 95.0,
+    max_depth_scale: float = 5.0,
+    max_depth_abs: Optional[float] = None,
+    max_attempts: int = 10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sample pixels per view according to a probability field (gt_pf.npy) and
+    backproject into world space using dense depth maps.
+
+    The probability field is loaded from the same directory as the Instant-GI
+    gaussian checkpoint for that frame:
+        <frame>/<init_method>/gt_pf.npy
+
+    This behaves similarly to rand-depth, but samples x/y using the probability
+    field instead of uniform random sampling.
+
+    Returns:
+        points (torch.Tensor): [N, 3] world positions.
+        colors (torch.Tensor): [N, 3] RGB in [0, 1].
+    """
+    valid_views: List[int] = []
+    for idx, image_path in enumerate(parser.image_paths):
+        stem = Path(image_path).stem
+        if depth_loader.depth_path_for_stem(stem) is None:
+            continue
+        frame = gaussian_dataset.get_frame(stem)
+        if frame is None:
+            continue
+        pf_path = frame.path.parent / "gt_pf.npy"
+        if pf_path.exists():
+            valid_views.append(idx)
+
+    if not valid_views:
+        raise ValueError("gs-prob found no views with both depth maps and gt_pf.npy.")
+
+    per_view_target = int(np.ceil(num_points / len(valid_views)))
+
+    all_points: List[torch.Tensor] = []
+    all_colors: List[torch.Tensor] = []
+
+    for idx in valid_views:
+        image_path = parser.image_paths[idx]
+        stem = Path(image_path).stem
+
+        camera_id = parser.camera_ids[idx]
+        width, height = parser.imsize_dict[camera_id]
+
+        depth_np = depth_loader.load_depth(stem, target_hw=(height, width))
+        if depth_np is None:
+            continue
+
+        # Apply normalization scale if needed (same as gs-depth).
+        depth_scale = 1.0
+        if getattr(parser, "normalize", False):
+            transform = getattr(parser, "transform", None)
+            if transform is not None:
+                try:
+                    depth_scale = float(np.linalg.norm(np.asarray(transform)[0, :3]))
+                except Exception:
+                    depth_scale = 1.0
+        if depth_scale != 1.0:
+            depth_np = depth_np * depth_scale
+
+        valid_np = depth_np[np.isfinite(depth_np) & (depth_np > min_depth)]
+        if valid_np.size == 0:
+            continue
+        p_clip = float(np.percentile(valid_np, depth_percentile))
+        scene_scale = float(getattr(parser, "scene_scale", 0.0) or 0.0)
+        scene_clip = scene_scale * max_depth_scale if scene_scale > 0 else p_clip
+        max_depth = min(p_clip, scene_clip) if scene_clip > 0 else p_clip
+        if max_depth_abs is not None:
+            max_depth = min(max_depth, float(max_depth_abs))
+        max_depth = max(max_depth, min_depth)
+
+        frame = gaussian_dataset.get_frame(stem)
+        if frame is None:
+            continue
+        pf_path = frame.path.parent / "gt_pf.npy"
+        if not pf_path.exists():
+            continue
+        pf = np.load(str(pf_path)).astype(np.float32)
+        if pf.ndim == 3 and pf.shape[0] == 1:
+            pf = pf[0]
+        if pf.shape != (height, width):
+            pf_img = Image.fromarray(pf)
+            pf_img = pf_img.resize((width, height), resample=Image.BILINEAR)
+            pf = np.array(pf_img, dtype=np.float32)
+        pf = np.nan_to_num(pf, nan=0.0, posinf=0.0, neginf=0.0)
+        pf = np.clip(pf, 0.0, None)
+        pf_flat = torch.from_numpy(pf.reshape(-1))
+        if float(pf_flat.sum()) <= 0.0:
+            pf_flat = torch.ones_like(pf_flat)
+
+        depth_map = torch.from_numpy(depth_np).to(device=device, dtype=torch.float32)
+        K = torch.from_numpy(parser.Ks_dict[camera_id]).to(device=device, dtype=torch.float32)
+        camtoworld = torch.from_numpy(parser.camtoworlds[idx]).to(device=device, dtype=torch.float32)
+
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        R = camtoworld[:3, :3]
+        t = camtoworld[:3, 3]
+
+        try:
+            img_np = np.array(Image.open(image_path).convert("RGB"), dtype=np.uint8)
+        except Exception:
+            img_np = None
+
+        collected_pts: List[torch.Tensor] = []
+        collected_cols: List[torch.Tensor] = []
+
+        remaining = per_view_target
+        for _ in range(max_attempts):
+            if remaining <= 0:
+                break
+            sample_n = max(chunk_size, remaining * 2)
+
+            idx_flat = torch.multinomial(pf_flat, sample_n, replacement=True)
+            u_idx = (idx_flat % width).to(device=device, dtype=torch.long)
+            v_idx = (idx_flat // width).to(device=device, dtype=torch.long)
+
+            depth_sel = depth_map[v_idx, u_idx]
+            valid = (depth_sel > min_depth) & (depth_sel <= max_depth) & torch.isfinite(depth_sel)
+            if not torch.any(valid):
+                continue
+
+            u_v = u_idx[valid].to(dtype=torch.float32)
+            v_v = v_idx[valid].to(dtype=torch.float32)
+            d_v = depth_sel[valid]
+
+            dirs_cam = torch.stack(
+                [(u_v - cx) / fx, (v_v - cy) / fy, torch.ones_like(u_v)], dim=-1
+            )
+            pts_cam = dirs_cam * d_v.unsqueeze(-1)
+            pts_world = (R @ pts_cam.T).T + t
+
+            take = min(remaining, pts_world.shape[0])
+            if take <= 0:
+                break
+            collected_pts.append(pts_world[:take].cpu())
+
+            if img_np is not None:
+                uu = u_idx[valid][:take].clamp(0, width - 1).cpu().numpy()
+                vv = v_idx[valid][:take].clamp(0, height - 1).cpu().numpy()
+                cols = img_np[vv, uu].astype(np.float32) / 255.0
+                collected_cols.append(torch.from_numpy(cols))
+            else:
+                collected_cols.append(torch.zeros((take, 3), dtype=torch.float32))
+
+            remaining -= take
+
+        if collected_pts:
+            all_points.append(torch.cat(collected_pts, dim=0))
+            all_colors.append(torch.cat(collected_cols, dim=0))
+
+    if not all_points:
+        raise ValueError("gs-prob found no valid samples after filtering.")
+
+    points_t = torch.cat(all_points, dim=0)
+    colors_t = torch.cat(all_colors, dim=0)
+
+    if points_t.shape[0] > num_points:
+        idx_sel = torch.randperm(points_t.shape[0])[:num_points]
+        points_t = points_t[idx_sel]
+        colors_t = colors_t[idx_sel]
+
+    return points_t, colors_t
