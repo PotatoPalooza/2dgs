@@ -197,26 +197,31 @@ class ProjectedChamferLoss(nn.Module):
         self._scale_norm: Optional[float] = None
         self._rotation_norm: Optional[float] = None
 
-    def _subsample_features(self, features: torch.Tensor) -> torch.Tensor:
+    def _choose_indices(self, points: torch.Tensor) -> torch.Tensor:
         """
-        Subsample features to max_points if specified.
-        
-        Args:
-            features: [N, D] feature tensor
-            
-        Returns:
-            Subsampled features [min(N, max_points), D]
+        Pick a shared set of indices for all attributes based on xy positions.
         """
-        if self.max_points is None or features.shape[0] <= self.max_points:
-            return features
-        
+        n_points = points.shape[0]
+        if self.max_points is None or n_points <= self.max_points:
+            return torch.arange(n_points, device=points.device)
+
+        if self.sampling_mode == "fps":
+            return farthest_point_sampling(points, self.max_points)
         if self.sampling_mode == "random":
-            return random_subsample(features, self.max_points, dim=0)
-        elif self.sampling_mode == "fps":
-            indices = farthest_point_sampling(features, self.max_points)
-            return features[indices]
-        else:
-            raise ValueError(f"Unknown sampling_mode: {self.sampling_mode}")
+            return torch.randperm(n_points, device=points.device)[: self.max_points]
+
+        raise ValueError(f"Unknown sampling_mode: {self.sampling_mode}")
+
+    def _subsample_gaussian_dict(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Apply the same subsampling indices across all Gaussian attributes.
+        """
+        xy = data.get("xy")
+        if xy is None or xy.numel() == 0:
+            return data
+
+        idx = self._choose_indices(xy)
+        return {k: v[idx] for k, v in data.items() if v is not None}
 
     @torch.no_grad()
     def _get_gt_gaussians(self, image_idx: int) -> Optional[Dict[str, torch.Tensor]]:
@@ -287,7 +292,6 @@ class ProjectedChamferLoss(nn.Module):
         self,
         info: Dict,
         batch_idx: int,
-        screen_size: torch.Tensor,
         packed: bool,
         gaussian_means: torch.Tensor,
         gaussian_scales: torch.Tensor,
@@ -341,9 +345,8 @@ class ProjectedChamferLoss(nn.Module):
         xy = _project_points(points3d, viewmat, K, width, height)
         if xy is None or xy.numel() == 0:
             return None
-        xy_norm = xy / (screen_size - 1.0) * 2.0 - 1.0
 
-        result = {"xy": xy_norm}
+        result = {"xy": xy}
         # Use differentiable parameters directly
         result["scale"] = torch.exp(gaussian_scales[ids])[:, :2]  # [N,2]
         result["opacity"] = torch.sigmoid(gaussian_opacities[ids]).unsqueeze(-1)  # [N,1]
@@ -382,7 +385,6 @@ class ProjectedChamferLoss(nn.Module):
             )
 
         device = view_indices.device
-        screen_size = torch.tensor([width, height], device=device, dtype=torch.float32)
         camtoworlds = camtoworlds.to(device)
         Ks = Ks.to(device)
         gaussian_means = gaussian_means.to(device)
@@ -402,7 +404,6 @@ class ProjectedChamferLoss(nn.Module):
             pred_data = self._get_pred_gaussians(
                 render_info,
                 batch_i,
-                screen_size,
                 packed,
                 gaussian_means,
                 gaussian_scales,
@@ -415,10 +416,16 @@ class ProjectedChamferLoss(nn.Module):
             )
             if pred_data is None:
                 continue
-            
-            # Subsample xy consistently
-            gt_xy = self._subsample_features(gt_data["xy"].to(device))
-            pred_xy = self._subsample_features(pred_data["xy"])
+
+            # Move GT tensors to device before subsampling so indices align
+            gt_data = {k: v.to(device) for k, v in gt_data.items()}
+
+            # Subsample consistently across attributes
+            gt_data = self._subsample_gaussian_dict(gt_data)
+            pred_data = self._subsample_gaussian_dict(pred_data)
+
+            gt_xy = gt_data["xy"]
+            pred_xy = pred_data["xy"]
 
             if gt_xy.numel() == 0 or pred_xy.numel() == 0:
                 continue
@@ -430,28 +437,22 @@ class ProjectedChamferLoss(nn.Module):
             # NN matching from xy to regress other attrs
             attr_loss = torch.tensor(0.0, device=device)
             dists = torch.cdist(pred_xy, gt_xy)  # [Np, Ng]
-            nn_idx = dists.argmin(dim=1)  # [Np]
+            nn_pred_to_gt = dists.argmin(dim=1)  # [Np]
+            nn_gt_to_pred = dists.argmin(dim=0)  # [Ng]
 
-            if "opacity" in pred_data and "opacity" in gt_data:
-                gt_op = self._subsample_features(gt_data["opacity"].to(device))
-                pred_op = self._subsample_features(pred_data["opacity"])
-                if gt_op.shape[0] == gt_xy.shape[0] and pred_op.shape[0] == pred_xy.shape[0]:
-                    matched = gt_op[nn_idx]
-                    attr_loss = attr_loss + torch.nn.functional.l1_loss(pred_op, matched)
+            for key in ("opacity", "scale", "color"):
+                if key not in pred_data or key not in gt_data:
+                    continue
 
-            if "scale" in pred_data and "scale" in gt_data:
-                gt_scale = self._subsample_features(gt_data["scale"].to(device))
-                pred_scale = self._subsample_features(pred_data["scale"])
-                if gt_scale.shape[0] == gt_xy.shape[0] and pred_scale.shape[0] == pred_xy.shape[0]:
-                    matched = gt_scale[nn_idx]
-                    attr_loss = attr_loss + torch.nn.functional.l1_loss(pred_scale, matched)
+                pred_attr = pred_data[key]
+                gt_attr = gt_data[key]
+                if pred_attr.shape[0] != pred_xy.shape[0] or gt_attr.shape[0] != gt_xy.shape[0]:
+                    continue
 
-            if "color" in pred_data and "color" in gt_data:
-                gt_color = self._subsample_features(gt_data["color"].to(device))
-                pred_color = self._subsample_features(pred_data["color"])
-                if gt_color.shape[0] == gt_xy.shape[0] and pred_color.shape[0] == pred_xy.shape[0]:
-                    matched = gt_color[nn_idx]
-                    attr_loss = attr_loss + torch.nn.functional.l1_loss(pred_color, matched)
+                matched_gt = gt_attr[nn_pred_to_gt]
+                matched_pred = pred_attr[nn_gt_to_pred]
+                attr_loss = attr_loss + F.l1_loss(pred_attr, matched_gt)
+                attr_loss = attr_loss + F.l1_loss(gt_attr, matched_pred)
 
             total = chamfer_xy + attr_loss
             losses.append(total)
