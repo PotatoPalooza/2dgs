@@ -40,7 +40,12 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, FastStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
-from gs_init import lift_gaussians_to_3d
+from gs_init import (
+    lift_gaussians_to_3d,
+    lift_gaussians_to_3d_with_dense_depth,
+    lift_random_points_with_dense_depth,
+)
+from depth_loader import DepthLoader
 
 # Tyro helper so FastStrategy registers as its own subcommand instead of
 # collapsing into DefaultStrategy (its superclass).
@@ -99,6 +104,19 @@ class Config:
     steps_scaler: float = 1.0
     # Optional cap on total gaussians when using gs-init (None = no cap)
     max_init_splats: Optional[int] = None
+
+    # Optional directory containing dense depth maps for this scene.
+    # If set (or inferred), init_type="gs-depth" will backproject 2D gaussians
+    # using these depths instead of sparse SfM points.
+    dense_depth_dir: Optional[str] = None
+    # Prefer loading .npy depths over .png if both exist.
+    dense_depth_prefer_npy: bool = True
+    # Percentile used to compute a per-image far clip for dense depths.
+    dense_depth_percentile: float = 95.0
+    # Additional far clip as multiple of parser.scene_scale (helps unbounded skies).
+    dense_depth_max_scale: float = 5.0
+    # Optional absolute far clip in meters (overrides if smaller than percentile/scale clip).
+    dense_depth_max_abs: Optional[float] = None
 
     # Number of training steps
     max_steps: int = 30_000
@@ -256,6 +274,21 @@ def infer_gaussian_dir_from_data(data_dir: str, data_factor: int) -> Optional[Pa
     return gaussian_root if gaussian_root.exists() else None
 
 
+def infer_dense_depth_dir_from_data(data_dir: str) -> Optional[Path]:
+    """
+    Heuristic to map a data directory to the default DA3 depth output location.
+
+    Example:
+        data_dir = data/360_v2/garden
+        -> data/da3_mipnerf_depths/garden
+    """
+    base = Path(data_dir)
+    dataset_root = base.parent
+    parent = dataset_root.parent
+    depth_root = parent / "da3_mipnerf_depths" / base.name
+    return depth_root if depth_root.exists() else None
+
+
 def create_splats_with_optimizers(
     parser: Parser,
     init_type: str = "sfm",
@@ -280,6 +313,10 @@ def create_splats_with_optimizers(
     world_size: int = 1,
     gaussian_dataset=None,
     image_to_gaussians=None,
+    depth_loader: Optional[DepthLoader] = None,
+    dense_depth_percentile: float = 95.0,
+    dense_depth_max_scale: float = 5.0,
+    dense_depth_max_abs: Optional[float] = None,
     max_init_splats: Optional[int] = None,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
@@ -299,8 +336,39 @@ def create_splats_with_optimizers(
             mode="ray",
             max_samples=max_init_splats,
         )
+    elif init_type == "gs-depth":
+        if gaussian_dataset is None or image_to_gaussians is None or depth_loader is None:
+            raise ValueError(
+                "gs-depth requires gaussian_dataset, image_to_gaussians, and depth_loader."
+            )
+        points, rgbs = lift_gaussians_to_3d_with_dense_depth(
+            parser,
+            gaussian_dataset,
+            image_to_gaussians,
+            depth_loader=depth_loader,
+            device=torch.device(device),
+            depth_percentile=dense_depth_percentile,
+            max_depth_scale=dense_depth_max_scale,
+            max_depth_abs=dense_depth_max_abs,
+            max_samples=max_init_splats,
+        )
+    elif init_type == "rand-depth":
+        if depth_loader is None:
+            raise ValueError("rand-depth requires depth_loader.")
+        target_n = max_init_splats if max_init_splats is not None else init_num_pts
+        points, rgbs = lift_random_points_with_dense_depth(
+            parser,
+            depth_loader=depth_loader,
+            num_points=int(target_n),
+            device=torch.device(device),
+            depth_percentile=dense_depth_percentile,
+            max_depth_scale=dense_depth_max_scale,
+            max_depth_abs=dense_depth_max_abs,
+        )
     else:
-        raise ValueError("Please specify a correct init_type: sfm, random, or gs-init")
+        raise ValueError(
+            "Please specify a correct init_type: sfm, random, gs-init, gs-depth, or rand-depth"
+        )
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -450,6 +518,22 @@ class Runner:
             else:
                 print("No gaussian directory inferred; skipping 2D gaussian loading.")
 
+        # Optional dense depth maps (for gs-depth init).
+        self.depth_loader: Optional[DepthLoader] = None
+        depth_root: Optional[Path] = None
+        if cfg.dense_depth_dir is not None:
+            depth_root = Path(cfg.dense_depth_dir)
+        else:
+            depth_root = infer_dense_depth_dir_from_data(cfg.data_dir)
+
+        if depth_root is not None and depth_root.exists():
+            self.depth_loader = DepthLoader(
+                depth_root, prefer_npy=cfg.dense_depth_prefer_npy, cache=True
+            )
+            print(f"Using dense depth maps from {depth_root}")
+        elif cfg.dense_depth_dir is not None:
+            print(f"Dense depth directory not found: {depth_root}")
+
         self.trainset = Dataset(
             self.parser,
             split="train",
@@ -496,6 +580,10 @@ class Runner:
             world_size=world_size,
             gaussian_dataset=self.gaussian_dataset,
             image_to_gaussians=getattr(self, "image_to_gaussians", None),
+            depth_loader=getattr(self, "depth_loader", None),
+            dense_depth_percentile=cfg.dense_depth_percentile,
+            dense_depth_max_scale=cfg.dense_depth_max_scale,
+            dense_depth_max_abs=cfg.dense_depth_max_abs,
             max_init_splats=cfg.max_init_splats,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))

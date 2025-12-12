@@ -77,54 +77,6 @@ def _project_points(
     return xy / scale * 2.0 - 1.0
 
 
-def _conic_to_scale_rot(conics: torch.Tensor) -> Optional[tuple]:
-    if conics is None or conics.numel() == 0:
-        return None
-    a, b, c = conics[:, 0], conics[:, 1], conics[:, 2]
-    trace = a + c
-    det = a * c - b * b
-    discriminant = torch.clamp(trace * trace - 4 * det, min=0.0)
-    sqrt_disc = torch.sqrt(discriminant)
-    lambda1 = (trace + sqrt_disc) / 2
-    lambda2 = (trace - sqrt_disc) / 2
-    scale_x = torch.clamp(1.0 / torch.sqrt(torch.clamp(lambda1, min=1e-6)), max=10.0)
-    scale_y = torch.clamp(1.0 / torch.sqrt(torch.clamp(lambda2, min=1e-6)), max=10.0)
-    rotation = torch.atan2(b, lambda1 - a).unsqueeze(-1) % (2 * 3.14159265)
-    return torch.stack([scale_x, scale_y], dim=-1), rotation
-
-# --- NEW: Subsampling utility ---
-
-def random_subsample(tensor: torch.Tensor, max_points: int, dim: int = 0) -> torch.Tensor:
-    """
-    Randomly subsample tensor along specified dimension.
-    
-    Args:
-        tensor: Input tensor to subsample
-        max_points: Maximum number of points to keep
-        dim: Dimension to subsample along (default: 0)
-        
-    Returns:
-        Subsampled tensor
-    """
-    n_points = tensor.shape[dim]
-    if n_points <= max_points:
-        return tensor
-    
-    # Random indices without replacement
-    indices = torch.randperm(n_points, device=tensor.device)[:max_points]
-    
-    # Index along the specified dimension
-    if dim == 0:
-        return tensor[indices]
-    elif dim == 1:
-        return tensor[:, indices]
-    else:
-        # For higher dimensions, use advanced indexing
-        index_tuple = [slice(None)] * tensor.ndim
-        index_tuple[dim] = indices
-        return tensor[tuple(index_tuple)]
-
-
 def farthest_point_sampling(points: torch.Tensor, n_samples: int) -> torch.Tensor:
     """
     Farthest Point Sampling (FPS) for more uniform coverage.
@@ -171,7 +123,7 @@ class ProjectedChamferLoss(nn.Module):
         gaussian_dataset, 
         image_paths: List[str],
         chunk_size: int = 8192,
-        attribute_mode: Literal["xy_only", "all", "geometric"] = "geometric",
+        attribute_mode: Literal["xy_only", "all", "geometric"] = "all",
         weights: Optional[Dict[str, float]] = None,
         max_points: Optional[int] = 10000,  # NEW: Maximum points to use
         sampling_mode: Literal["random", "fps"] = "random",  # NEW: Sampling strategy
@@ -184,18 +136,7 @@ class ProjectedChamferLoss(nn.Module):
         self.max_points = max_points  # NEW: e.g., 10000
         self.sampling_mode = sampling_mode  # NEW
         
-        default_weights = {
-            "xy": 1.0, 
-            "scale": 0.5, 
-            "rotation": 0.3, 
-            "opacity": 0.2, 
-            "color": 0.5 
-        }
-        self.weights = weights if weights is not None else default_weights
-        
         self._cache: Dict[str, Dict[str, torch.Tensor]] = {}
-        self._scale_norm: Optional[float] = None
-        self._rotation_norm: Optional[float] = None
 
     def _choose_indices(self, points: torch.Tensor) -> torch.Tensor:
         """
@@ -247,46 +188,6 @@ class ProjectedChamferLoss(nn.Module):
             }
             
         return self._cache[stem]
-
-    def _normalize_attributes(
-        self,
-        xy: torch.Tensor,
-        scale: Optional[torch.Tensor] = None,
-        rotation: Optional[torch.Tensor] = None,
-        opacity: Optional[torch.Tensor] = None,
-        color: Optional[torch.Tensor] = None,
-        attr_mode: Optional[str] = None,
-    ) -> torch.Tensor:
-        """Normalize and concatenate attributes into a feature vector [N, D_f]."""
-        mode = attr_mode if attr_mode is not None else self.attribute_mode
-        features = [xy]
-
-        if mode == "xy_only":
-            return torch.cat(features, dim=-1)
-
-        if mode in ["geometric", "all"]:
-            if scale is not None:
-                if self._scale_norm is None:
-                    self._scale_norm = 10.0
-                scale_norm = (scale / self._scale_norm) * self.weights["scale"]
-                features.append(scale_norm)
-
-            if rotation is not None:
-                if self._rotation_norm is None:
-                    self._rotation_norm = 2 * 3.14159265
-                rotation_norm = (rotation / self._rotation_norm) * self.weights["rotation"]
-                features.append(rotation_norm)
-
-        if mode == "all":
-            if opacity is not None:
-                opacity_norm = opacity * self.weights["opacity"]
-                features.append(opacity_norm)
-
-            if color is not None:
-                color_norm = color * self.weights["color"]
-                features.append(color_norm)
-
-        return torch.cat(features, dim=-1)
 
     def _get_pred_gaussians(
         self,
@@ -348,7 +249,6 @@ class ProjectedChamferLoss(nn.Module):
 
         result = {"xy": xy}
         # Use differentiable parameters directly
-        result["scale"] = torch.exp(gaussian_scales[ids])[:, :2]  # [N,2]
         result["opacity"] = torch.sigmoid(gaussian_opacities[ids]).unsqueeze(-1)  # [N,1]
         if gaussian_colors is not None:
             result["color"] = gaussian_colors[ids]  # [N,3]
@@ -368,6 +268,10 @@ class ProjectedChamferLoss(nn.Module):
         gaussian_scales: Optional[torch.Tensor] = None,
         gaussian_opacities: Optional[torch.Tensor] = None,
         gaussian_colors: Optional[torch.Tensor] = None,
+        step: int = 0,
+        use_attr_loss: bool = True,
+        color_warmup: int = 500,
+        attr_weight: float = 0.1,
     ) -> torch.Tensor:
         
         if self.dataset is None:
@@ -378,10 +282,9 @@ class ProjectedChamferLoss(nn.Module):
             or gaussian_means is None
             or gaussian_scales is None
             or gaussian_opacities is None
-            or gaussian_colors is None
         ):
             raise ValueError(
-                "Chamfer loss needs camtoworlds, Ks, gaussian_means, scales, opacities, colors."
+                "Chamfer loss needs camtoworlds, Ks, gaussian_means, scales, opacities."
             )
 
         device = view_indices.device
@@ -390,9 +293,27 @@ class ProjectedChamferLoss(nn.Module):
         gaussian_means = gaussian_means.to(device)
         gaussian_scales = gaussian_scales.to(device)
         gaussian_opacities = gaussian_opacities.to(device)
-        gaussian_colors = gaussian_colors.to(device)
+        gaussian_colors = gaussian_colors.to(device) if gaussian_colors is not None else None
         viewmats = torch.linalg.inv(camtoworlds)
         losses = []
+
+        # Determine which attributes should contribute based on mode and warmup
+        if not use_attr_loss:
+            attr_keys: List[str] = []
+        else:
+            if self.attribute_mode == "xy_only":
+                attr_keys = []
+            elif self.attribute_mode == "geometric":
+                attr_keys = []
+            elif self.attribute_mode == "all":
+                attr_keys = ["opacity"]
+                if step >= color_warmup:
+                    attr_keys.append("color")
+            else:
+                raise ValueError(f"Unknown attribute_mode {self.attribute_mode}")
+
+        if "color" in attr_keys and gaussian_colors is None:
+            raise ValueError("attribute_mode requires color supervision but gaussian_colors is None.")
 
         for batch_i, view_idx in enumerate(view_indices.tolist()):
             # 1. Get Ground Truth (Target) - Expected shape: [N, D_f]
@@ -436,11 +357,11 @@ class ProjectedChamferLoss(nn.Module):
 
             # NN matching from xy to regress other attrs
             attr_loss = torch.tensor(0.0, device=device)
-            dists = torch.cdist(pred_xy, gt_xy)  # [Np, Ng]
+            dists = torch.cdist(pred_xy.detach(), gt_xy.detach())  # [Np, Ng]
             nn_pred_to_gt = dists.argmin(dim=1)  # [Np]
             nn_gt_to_pred = dists.argmin(dim=0)  # [Ng]
 
-            for key in ("opacity", "scale", "color"):
+            for key in attr_keys:
                 if key not in pred_data or key not in gt_data:
                     continue
 
@@ -454,7 +375,7 @@ class ProjectedChamferLoss(nn.Module):
                 attr_loss = attr_loss + F.l1_loss(pred_attr, matched_gt)
                 attr_loss = attr_loss + F.l1_loss(gt_attr, matched_pred)
 
-            total = chamfer_xy + attr_loss
+            total = chamfer_xy + attr_weight * attr_loss
             losses.append(total)
 
         if not losses:
