@@ -45,6 +45,7 @@ from gs_init import (
     lift_gaussians_to_3d_with_dense_depth,
     lift_random_points_with_dense_depth,
     lift_prob_points_with_dense_depth,
+    lift_prob_multi_points_with_dense_depth,
 )
 from depth_loader import DepthLoader
 
@@ -60,6 +61,65 @@ try:
     )
 except AttributeError:
     StrategyConfig = Union[FastStrategy, DefaultStrategy, MCMCStrategy]
+
+
+def _write_ply_xyzrgb(path: Union[str, Path], xyz: np.ndarray, rgb: np.ndarray) -> None:
+    """
+    Write a point cloud as a binary little-endian PLY with XYZ + RGB.
+
+    Args:
+        path: Output file path.
+        xyz: (N, 3) float32.
+        rgb: (N, 3) uint8.
+    """
+    path = Path(path)
+    xyz = np.asarray(xyz, dtype=np.float32)
+    rgb = np.asarray(rgb, dtype=np.uint8)
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise ValueError(f"xyz must be (N,3), got {xyz.shape}")
+    if rgb.ndim != 2 or rgb.shape[1] != 3:
+        raise ValueError(f"rgb must be (N,3), got {rgb.shape}")
+    if xyz.shape[0] != rgb.shape[0]:
+        raise ValueError(f"xyz/rgb length mismatch: {xyz.shape[0]} vs {rgb.shape[0]}")
+
+    vertex = np.empty(
+        xyz.shape[0],
+        dtype=[
+            ("x", "<f4"),
+            ("y", "<f4"),
+            ("z", "<f4"),
+            ("red", "u1"),
+            ("green", "u1"),
+            ("blue", "u1"),
+        ],
+    )
+    vertex["x"] = xyz[:, 0]
+    vertex["y"] = xyz[:, 1]
+    vertex["z"] = xyz[:, 2]
+    vertex["red"] = rgb[:, 0]
+    vertex["green"] = rgb[:, 1]
+    vertex["blue"] = rgb[:, 2]
+
+    header = "\n".join(
+        [
+            "ply",
+            "format binary_little_endian 1.0",
+            f"element vertex {xyz.shape[0]}",
+            "property float x",
+            "property float y",
+            "property float z",
+            "property uchar red",
+            "property uchar green",
+            "property uchar blue",
+            "end_header",
+            "",
+        ]
+    ).encode("ascii")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:  # noqa: PTH123
+        f.write(header)
+        vertex.tofile(f)
 
 
 @dataclass
@@ -118,6 +178,25 @@ class Config:
     dense_depth_max_scale: float = 5.0
     # Optional absolute far clip in meters (overrides if smaller than percentile/scale clip).
     dense_depth_max_abs: Optional[float] = None
+
+    # Multi-view probability-field initializer (init_type="gs-prob-multi").
+    # Oversample factor per view to encourage multi-view overlap.
+    gs_prob_multi_oversample: float = 4.0
+    # World-space voxel size used to aggregate multi-view support (None = auto from scene_scale).
+    gs_prob_multi_voxel_size: Optional[float] = None
+    # Minimum number of distinct views supporting a voxel.
+    gs_prob_multi_min_views: int = 2
+    # Additional weighting toward higher view counts (score *= view_count ** view_power).
+    gs_prob_multi_view_power: float = 0.5
+    # Optional jitter within voxel size fraction (helps if sampling with replacement).
+    gs_prob_multi_jitter_frac: float = 0.0
+    # Seed for gs-prob-multi sampling (does not affect global RNG).
+    gs_prob_multi_seed: int = 0
+
+    # Save the initialized point cloud (means + initial colors) under result_dir.
+    save_init_ply: bool = True
+    # Filename for the init point cloud (single-rank), or prefix (multi-rank adds _rankK).
+    init_ply_name: str = "init_points.ply"
 
     # Number of training steps
     max_steps: int = 30_000
@@ -319,6 +398,12 @@ def create_splats_with_optimizers(
     dense_depth_max_scale: float = 5.0,
     dense_depth_max_abs: Optional[float] = None,
     max_init_splats: Optional[int] = None,
+    gs_prob_multi_oversample: float = 4.0,
+    gs_prob_multi_voxel_size: Optional[float] = None,
+    gs_prob_multi_min_views: int = 2,
+    gs_prob_multi_view_power: float = 0.5,
+    gs_prob_multi_jitter_frac: float = 0.0,
+    gs_prob_multi_seed: int = 0,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     init_scales_log: Optional[torch.Tensor] = None
     init_opacities_logit: Optional[torch.Tensor] = None
@@ -383,9 +468,29 @@ def create_splats_with_optimizers(
             max_depth_scale=dense_depth_max_scale,
             max_depth_abs=dense_depth_max_abs,
         )
+    elif init_type == "gs-prob-multi":
+        if gaussian_dataset is None or depth_loader is None:
+            raise ValueError("gs-prob-multi requires gaussian_dataset and depth_loader.")
+        target_n = max_init_splats if max_init_splats is not None else init_num_pts
+        points, rgbs, init_scales_log = lift_prob_multi_points_with_dense_depth(
+            parser,
+            gaussian_dataset=gaussian_dataset,
+            depth_loader=depth_loader,
+            num_points=int(target_n),
+            device=torch.device(device),
+            oversample=gs_prob_multi_oversample,
+            voxel_size=gs_prob_multi_voxel_size,
+            min_views=gs_prob_multi_min_views,
+            view_power=gs_prob_multi_view_power,
+            jitter_frac=gs_prob_multi_jitter_frac,
+            seed=gs_prob_multi_seed,
+            depth_percentile=dense_depth_percentile,
+            max_depth_scale=dense_depth_max_scale,
+            max_depth_abs=dense_depth_max_abs,
+        )
     else:
         raise ValueError(
-            "Please specify a correct init_type: sfm, random, gs-init, gs-depth, rand-depth, or gs-prob"
+            "Please specify a correct init_type: sfm, random, gs-init, gs-depth, rand-depth, gs-prob, or gs-prob-multi"
         )
 
     # Initialize the GS size.
@@ -616,8 +721,30 @@ class Runner:
             dense_depth_max_scale=cfg.dense_depth_max_scale,
             dense_depth_max_abs=cfg.dense_depth_max_abs,
             max_init_splats=cfg.max_init_splats,
+            gs_prob_multi_oversample=cfg.gs_prob_multi_oversample,
+            gs_prob_multi_voxel_size=cfg.gs_prob_multi_voxel_size,
+            gs_prob_multi_min_views=cfg.gs_prob_multi_min_views,
+            gs_prob_multi_view_power=cfg.gs_prob_multi_view_power,
+            gs_prob_multi_jitter_frac=cfg.gs_prob_multi_jitter_frac,
+            gs_prob_multi_seed=cfg.gs_prob_multi_seed,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
+
+        if cfg.save_init_ply:
+            means = self.splats["means"].detach().float().cpu().numpy()
+            if "colors" in self.splats:
+                rgb = torch.sigmoid(self.splats["colors"].detach()).float().cpu().numpy()
+            else:
+                C0 = 0.28209479177387814
+                rgb = (self.splats["sh0"].detach()[:, 0, :].float().cpu().numpy() * C0) + 0.5
+            rgb = np.clip(rgb, 0.0, 1.0)
+            rgb_u8 = (rgb * 255.0 + 0.5).astype(np.uint8)
+
+            out = Path(cfg.result_dir) / cfg.init_ply_name
+            if world_size > 1:
+                out = out.with_name(f"{out.stem}_rank{world_rank}{out.suffix}")
+            _write_ply_xyzrgb(out, means, rgb_u8)
+            print(f"Saved init point cloud: {out}")
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)

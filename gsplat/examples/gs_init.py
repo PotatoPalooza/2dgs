@@ -711,3 +711,311 @@ def lift_prob_points_with_dense_depth(
         colors_t = colors_t[idx_sel]
 
     return points_t, colors_t
+
+
+def lift_prob_multi_points_with_dense_depth(
+    parser: Parser,
+    gaussian_dataset: GaussianImageDataset,
+    depth_loader: DepthLoader,
+    num_points: int,
+    device: torch.device = torch.device("cpu"),
+    oversample: float = 4.0,
+    voxel_size: Optional[float] = None,
+    min_views: int = 2,
+    view_power: float = 0.5,
+    jitter_frac: float = 0.0,
+    seed: int = 0,
+    chunk_size: int = 8192,
+    min_depth: float = 1e-3,
+    depth_percentile: float = 95.0,
+    max_depth_scale: float = 5.0,
+    max_depth_abs: Optional[float] = None,
+    max_attempts: int = 10,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Multi-view consistent sampling from per-view probability fields (gt_pf.npy).
+
+    This initializer backprojects candidate points from each view using aligned
+    dense depth maps, quantizes into world-space voxels, and prefers voxels that
+    receive high probability support from many views.
+
+    Returns:
+        points (torch.Tensor): [N, 3] world positions.
+        colors (torch.Tensor): [N, 3] RGB in [0, 1].
+        scales_log (torch.Tensor): [N, 3] log stddev used to avoid KNN init.
+    """
+
+    def _pack_voxel_keys(vox: torch.Tensor) -> torch.Tensor:
+        """
+        Pack integer voxel coordinates into a 64-bit key.
+
+        Uses 21 bits per axis (signed range [-2^20, 2^20-1]). If any coordinate
+        is out of range, falls back to a hashed key (rare with reasonable voxel_size).
+        """
+        if vox.numel() == 0:
+            return torch.empty((0,), device=vox.device, dtype=torch.int64)
+        offset = 1 << 20
+        max_abs = offset - 1
+        if torch.any(torch.abs(vox) > max_abs):
+            x = vox[:, 0].to(torch.int64)
+            y = vox[:, 1].to(torch.int64)
+            z = vox[:, 2].to(torch.int64)
+            return (x * 73856093) ^ (y * 19349663) ^ (z * 83492791)
+        vx = (vox[:, 0] + offset).to(torch.int64)
+        vy = (vox[:, 1] + offset).to(torch.int64)
+        vz = (vox[:, 2] + offset).to(torch.int64)
+        return vx | (vy << 21) | (vz << 42)
+
+    if oversample <= 0:
+        raise ValueError(f"oversample must be > 0, got {oversample}")
+    if num_points <= 0:
+        raise ValueError(f"num_points must be > 0, got {num_points}")
+    if min_views <= 0:
+        raise ValueError(f"min_views must be > 0, got {min_views}")
+
+    scene_scale = float(getattr(parser, "scene_scale", 0.0) or 0.0)
+    if voxel_size is None:
+        voxel_size = scene_scale / 256.0 if scene_scale > 0 else 0.01
+    voxel_size = float(voxel_size)
+    if voxel_size <= 0:
+        raise ValueError(f"voxel_size must be > 0, got {voxel_size}")
+
+    valid_views: List[int] = []
+    for idx, image_path in enumerate(parser.image_paths):
+        stem = Path(image_path).stem
+        if depth_loader.depth_path_for_stem(stem) is None:
+            continue
+        frame = gaussian_dataset.get_frame(stem)
+        if frame is None:
+            continue
+        pf_path = frame.path.parent / "gt_pf.npy"
+        if pf_path.exists():
+            valid_views.append(idx)
+
+    if not valid_views:
+        raise ValueError("gs-prob-multi found no views with both depth maps and gt_pf.npy.")
+
+    per_view_target = int(np.ceil(num_points / len(valid_views)))
+    per_view_samples = int(np.ceil(per_view_target * float(oversample)))
+    per_view_samples = max(1, per_view_samples)
+
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+
+    all_keys: List[torch.Tensor] = []
+    all_centroids: List[torch.Tensor] = []
+    all_colors: List[torch.Tensor] = []
+    all_weights: List[torch.Tensor] = []
+
+    for idx in valid_views:
+        image_path = parser.image_paths[idx]
+        stem = Path(image_path).stem
+
+        camera_id = parser.camera_ids[idx]
+        width, height = parser.imsize_dict[camera_id]
+
+        depth_np = depth_loader.load_depth(stem, target_hw=(height, width))
+        if depth_np is None:
+            continue
+
+        # Apply normalization scale if needed (same as gs-depth).
+        depth_scale = 1.0
+        if getattr(parser, "normalize", False):
+            transform = getattr(parser, "transform", None)
+            if transform is not None:
+                try:
+                    depth_scale = float(np.linalg.norm(np.asarray(transform)[0, :3]))
+                except Exception:
+                    depth_scale = 1.0
+        if depth_scale != 1.0:
+            depth_np = depth_np * depth_scale
+
+        valid_np = depth_np[np.isfinite(depth_np) & (depth_np > min_depth)]
+        if valid_np.size == 0:
+            continue
+        p_clip = float(np.percentile(valid_np, depth_percentile))
+        scene_clip = scene_scale * max_depth_scale if scene_scale > 0 else p_clip
+        max_depth = min(p_clip, scene_clip) if scene_clip > 0 else p_clip
+        if max_depth_abs is not None:
+            max_depth = min(max_depth, float(max_depth_abs))
+        max_depth = max(max_depth, min_depth)
+
+        frame = gaussian_dataset.get_frame(stem)
+        if frame is None:
+            continue
+        pf_path = frame.path.parent / "gt_pf.npy"
+        if not pf_path.exists():
+            continue
+        pf = np.load(str(pf_path)).astype(np.float32)
+        if pf.ndim == 3 and pf.shape[0] == 1:
+            pf = pf[0]
+        if pf.shape != (height, width):
+            pf_img = Image.fromarray(pf)
+            pf_img = pf_img.resize((width, height), resample=Image.BILINEAR)
+            pf = np.array(pf_img, dtype=np.float32)
+        pf = np.nan_to_num(pf, nan=0.0, posinf=0.0, neginf=0.0)
+        pf = np.clip(pf, 0.0, None)
+        pf_flat = torch.from_numpy(pf.reshape(-1)).to(dtype=torch.float32, device="cpu")
+        if float(pf_flat.sum()) <= 0.0:
+            pf_flat = torch.ones_like(pf_flat)
+        pf_max = float(torch.max(pf_flat).item())
+        if pf_max <= 0.0:
+            pf_max = 1.0
+
+        depth_map = torch.from_numpy(depth_np).to(device=device, dtype=torch.float32)
+        K = torch.from_numpy(parser.Ks_dict[camera_id]).to(device=device, dtype=torch.float32)
+        camtoworld = torch.from_numpy(parser.camtoworlds[idx]).to(device=device, dtype=torch.float32)
+
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        R = camtoworld[:3, :3]
+        t = camtoworld[:3, 3]
+
+        try:
+            img_np = np.array(Image.open(image_path).convert("RGB"), dtype=np.uint8)
+        except Exception:
+            img_np = None
+
+        collected_pts: List[torch.Tensor] = []
+        collected_cols: List[torch.Tensor] = []
+        collected_w: List[torch.Tensor] = []
+
+        remaining = per_view_samples
+        for _ in range(max_attempts):
+            if remaining <= 0:
+                break
+            sample_n = max(chunk_size, remaining * 2)
+
+            idx_flat = torch.multinomial(pf_flat, sample_n, replacement=True, generator=gen)
+            u_cpu = (idx_flat % width).to(dtype=torch.long, device="cpu")
+            v_cpu = (idx_flat // width).to(dtype=torch.long, device="cpu")
+            w_cpu = (pf_flat[idx_flat] / pf_max).to(dtype=torch.float32, device="cpu")
+
+            u_idx = u_cpu.to(device=device)
+            v_idx = v_cpu.to(device=device)
+            w = w_cpu.to(device=device)
+
+            depth_sel = depth_map[v_idx, u_idx]
+            valid = (depth_sel > min_depth) & (depth_sel <= max_depth) & torch.isfinite(depth_sel)
+            if not torch.any(valid):
+                continue
+
+            valid_idx = torch.nonzero(valid, as_tuple=False).squeeze(1)
+            take = min(remaining, int(valid_idx.shape[0]))
+            if take <= 0:
+                continue
+            valid_idx = valid_idx[:take]
+            valid_idx_cpu = valid_idx.cpu()
+
+            u_v = u_idx[valid_idx].to(dtype=torch.float32)
+            v_v = v_idx[valid_idx].to(dtype=torch.float32)
+            d_v = depth_sel[valid_idx]
+            w_v = w[valid_idx]
+
+            dirs_cam = torch.stack(
+                [(u_v - cx) / fx, (v_v - cy) / fy, torch.ones_like(u_v)], dim=-1
+            )
+            pts_cam = dirs_cam * d_v.unsqueeze(-1)
+            pts_world = (R @ pts_cam.T).T + t
+
+            if img_np is not None:
+                uu = u_cpu[valid_idx_cpu].clamp(0, width - 1).numpy()
+                vv = v_cpu[valid_idx_cpu].clamp(0, height - 1).numpy()
+                cols = img_np[vv, uu].astype(np.float32) / 255.0
+                cols_t = torch.from_numpy(cols).to(device=device, dtype=torch.float32)
+            else:
+                cols_t = torch.zeros((take, 3), device=device, dtype=torch.float32)
+
+            collected_pts.append(pts_world)
+            collected_cols.append(cols_t)
+            collected_w.append(w_v)
+            remaining -= take
+
+        if not collected_pts:
+            continue
+
+        pts_all = torch.cat(collected_pts, dim=0)
+        cols_all = torch.cat(collected_cols, dim=0)
+        w_all = torch.cat(collected_w, dim=0).clamp(min=0.0)
+
+        vox = torch.floor(pts_all / float(voxel_size)).to(torch.int64)
+        keys = _pack_voxel_keys(vox)
+
+        unique_keys, inv = torch.unique(keys, return_inverse=True)
+        n_vox = int(unique_keys.shape[0])
+
+        ones = torch.ones_like(inv, dtype=torch.float32, device=device)
+        hits = torch.zeros(n_vox, device=device, dtype=torch.float32).index_add_(0, inv, ones)
+        w_sum = torch.zeros(n_vox, device=device, dtype=torch.float32).index_add_(0, inv, w_all)
+
+        p_sum = torch.zeros((n_vox, 3), device=device, dtype=torch.float32).index_add_(
+            0, inv, pts_all * w_all.unsqueeze(-1)
+        )
+        c_sum = torch.zeros((n_vox, 3), device=device, dtype=torch.float32).index_add_(
+            0, inv, cols_all * w_all.unsqueeze(-1)
+        )
+
+        denom = w_sum.clamp(min=1e-8).unsqueeze(-1)
+        centroids = p_sum / denom
+        colors = c_sum / denom
+        w_mean = w_sum / hits.clamp(min=1.0)
+
+        all_keys.append(unique_keys.cpu())
+        all_centroids.append(centroids.cpu())
+        all_colors.append(colors.cpu().clamp(0.0, 1.0))
+        all_weights.append(w_mean.cpu())
+
+    if not all_keys:
+        raise ValueError("gs-prob-multi found no valid samples after filtering.")
+
+    keys_all = torch.cat(all_keys, dim=0)
+    centroids_all = torch.cat(all_centroids, dim=0)
+    colors_all = torch.cat(all_colors, dim=0)
+    w_all = torch.cat(all_weights, dim=0).clamp(min=0.0)
+
+    global_keys, inv_global = torch.unique(keys_all, return_inverse=True)
+    n_global = int(global_keys.shape[0])
+
+    one = torch.ones_like(inv_global, dtype=torch.float32)
+    view_count = torch.zeros(n_global, dtype=torch.float32).index_add_(0, inv_global, one)
+    w_sum = torch.zeros(n_global, dtype=torch.float32).index_add_(0, inv_global, w_all)
+
+    centroid_sum = torch.zeros((n_global, 3), dtype=torch.float32).index_add_(
+        0, inv_global, centroids_all * w_all.unsqueeze(-1)
+    )
+    color_sum = torch.zeros((n_global, 3), dtype=torch.float32).index_add_(
+        0, inv_global, colors_all * w_all.unsqueeze(-1)
+    )
+
+    denom = w_sum.clamp(min=1e-8).unsqueeze(-1)
+    centroids_g = centroid_sum / denom
+    colors_g = color_sum / denom
+
+    keep = view_count >= float(min_views)
+    if not torch.any(keep):
+        raise ValueError(
+            f"gs-prob-multi found no voxels with min_views={min_views}. "
+            "Try lowering min_views or increasing oversample/voxel_size."
+        )
+
+    cand_idx = torch.nonzero(keep, as_tuple=False).squeeze(1)
+    scores = w_sum[keep] * torch.pow(view_count[keep], float(view_power))
+    if float(scores.sum()) <= 0.0:
+        scores = torch.ones_like(scores)
+
+    replace = int(cand_idx.shape[0]) < int(num_points)
+    sel = torch.multinomial(scores, int(num_points), replacement=replace, generator=gen)
+    chosen = cand_idx[sel]
+
+    points_t = centroids_g[chosen]
+    colors_t = colors_g[chosen].clamp(0.0, 1.0)
+
+    if jitter_frac > 0.0:
+        jitter = (torch.rand(points_t.shape, generator=gen) - 0.5) * (float(voxel_size) * float(jitter_frac))
+        points_t = points_t + jitter.to(points_t.dtype)
+
+    base_sigma = max(float(voxel_size) * 0.5, 1e-6)
+    scales_log = torch.full(
+        (points_t.shape[0], 3), float(np.log(base_sigma)), dtype=torch.float32
+    )
+
+    return points_t, colors_t, scales_log
